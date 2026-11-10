@@ -8,7 +8,7 @@ import { Txt } from '@mastra/playground-ui/components/Txt';
 import { useId, useState } from 'react';
 import type { z } from 'zod';
 
-import { rawRuleProblem, readRawRule, ruleProblem } from '../services/rules';
+import { rawRuleProblem, readRawRule, repositoryHint, ruleProblem } from '../services/rules';
 
 type Facts = RuleBuilderProps['schema'];
 
@@ -34,8 +34,12 @@ const CARD_FACT_PROPERTIES = {
       kind: { type: 'string', title: 'Kind' },
       integration: { type: 'string', title: 'Integration' },
       provider: { type: 'string', title: 'Provider' },
-      // A GitHub repository or GitLab project path, a Linear team key, a Jira project key.
-      repository: { type: 'string', title: 'Repository, team or project' },
+      // A GitHub repository or GitLab project path, a Linear team key (ENG), a Jira project key (PLAT).
+      repository: {
+        type: 'string',
+        title: 'Repository, team or project',
+        examples: ['owner/repo', 'ENG', 'PLAT'],
+      },
     },
   },
 } satisfies Facts['properties'];
@@ -112,6 +116,7 @@ export function RuleEditor<Rule>({
   const setRaw = json ? json.onChange : setOwnRaw;
   const id = useId();
   const problem = raw === undefined ? ruleProblem(schema, rule) : rawRuleProblem(schema, raw);
+  const hint = raw === undefined ? repositoryHint(rule) : undefined;
 
   const editRaw = (text: string) => {
     setRaw(text);
@@ -167,6 +172,11 @@ export function RuleEditor<Rule>({
             }}
           />
         </div>
+      )}
+      {hint && (
+        <Txt as="p" variant="caption" tone="muted">
+          {hint}
+        </Txt>
       )}
       {problem && <FieldError>{problem}</FieldError>}
     </Field>

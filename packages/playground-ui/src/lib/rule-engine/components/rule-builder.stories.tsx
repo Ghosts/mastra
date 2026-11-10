@@ -210,3 +210,24 @@ export const DeeplyNested: Story = {
     />
   ),
 };
+
+export const FieldExamplesAsPlaceholder: Story = {
+  render: () => (
+    <RuleBuilderWithState
+      schema={{
+        type: 'object',
+        properties: {
+          repository: {
+            type: 'string',
+            title: 'Repository, team or project',
+            examples: ['owner/repo', 'ENG', 'PLAT'],
+          },
+        },
+      }}
+      initialRuleGroup={{
+        operator: 'AND',
+        conditions: [{ field: 'repository', operator: 'equals', value: undefined }],
+      }}
+    />
+  ),
+};

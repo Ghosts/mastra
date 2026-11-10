@@ -18,9 +18,9 @@ const PRIMITIVE_TYPES = new Set(['string', 'number', 'boolean', 'integer']);
  * A single rule row with field selector, operator selector, and value input
  */
 export const RuleRow: React.FC<RuleRowProps> = ({ schema, rule, onChange, onRemove, className }) => {
-  const fieldType = React.useMemo(() => {
-    return getFieldOptionAtPath(schema, rule.field)?.type;
-  }, [schema, rule.field]);
+  const fieldOption = React.useMemo(() => getFieldOptionAtPath(schema, rule.field), [schema, rule.field]);
+  const fieldType = fieldOption?.type;
+  const placeholder = fieldOption?.examples?.filter(example => typeof example === 'string').join(', ') || undefined;
 
   const isPrimitive = fieldType !== undefined && PRIMITIVE_TYPES.has(fieldType);
   const isArray = fieldType === 'array';
@@ -92,6 +92,7 @@ export const RuleRow: React.FC<RuleRowProps> = ({ schema, rule, onChange, onRemo
                 onChange={handleValueChange}
                 operator={rule.operator}
                 fieldType={fieldType}
+                placeholder={placeholder}
               />
             )}
           </>

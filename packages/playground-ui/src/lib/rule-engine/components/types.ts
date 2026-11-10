@@ -19,6 +19,8 @@ export type FieldOption = {
   children?: Record<string, JsonSchemaProperty>;
   /** Item schema if type is array */
   items?: JsonSchemaProperty;
+  /** Example values, shown as the value input's placeholder */
+  examples?: unknown[];
 };
 
 /**

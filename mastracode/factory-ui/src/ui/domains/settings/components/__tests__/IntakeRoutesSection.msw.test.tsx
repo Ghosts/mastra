@@ -234,7 +234,7 @@ describe('IntakeRoutesSection', () => {
     await user.click(ruleSelect('Select property'));
     expect(await screen.findByRole('option', { name: /Provider/ })).toBeInTheDocument();
     await user.click(screen.getByRole('option', { name: /Repository, team or project/ }));
-    await user.type(screen.getByPlaceholderText('Enter value'), 'acme/app');
+    await user.type(screen.getByPlaceholderText('owner/repo, ENG, PLAT'), 'acme/app');
     await user.click(screen.getByRole('combobox', { name: 'Board' }));
     await user.click(await screen.findByRole('option', { name: 'Ship' }));
     await user.click(screen.getByRole('button', { name: 'Add route' }));
@@ -245,6 +245,34 @@ describe('IntakeRoutesSection', () => {
       when: { operator: 'AND', conditions: [{ field: 'source.repository', operator: 'equals', value: 'acme/app' }] },
       target: { boardKey: 'ship', phaseKey: 'inbox' },
     });
+  });
+
+  it('shows the format a repository, team or project takes, and flags a GitHub repository missing its owner', async () => {
+    serveRoutes();
+    const user = userEvent.setup();
+    renderSection();
+
+    await user.click(await screen.findByRole('button', { name: 'Add route' }));
+    await user.click(screen.getByRole('button', { name: /Add conditional rule/ }));
+    await user.click(ruleSelect('Select field'));
+    await user.click(await screen.findByRole('option', { name: /Source/ }));
+    await user.click(ruleSelect('Select property'));
+    await user.click(await screen.findByRole('option', { name: /Repository, team or project/ }));
+    const repository = screen.getByPlaceholderText('owner/repo, ENG, PLAT');
+    await user.type(repository, 'mastra');
+    expect(screen.queryByText(/GitHub repositories are owner\/repo/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /Add rule/ }));
+    await user.click(ruleSelect('Select field'));
+    await user.click(await screen.findByRole('option', { name: /Source/ }));
+    await user.click(ruleSelect('Select property'));
+    await user.click(await screen.findByRole('option', { name: /Integration/ }));
+    await user.type(screen.getByPlaceholderText('Enter value'), 'github');
+    expect(await screen.findByText(/GitHub repositories are owner\/repo/)).toBeInTheDocument();
+
+    await user.clear(repository);
+    await user.type(repository, 'mastra-ai/mastra');
+    await waitFor(() => expect(screen.queryByText(/GitHub repositories are owner\/repo/)).not.toBeInTheDocument());
   });
 
   it("won't save a new-card route that tests the event, which new cards don't have", async () => {

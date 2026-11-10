@@ -17,6 +17,7 @@ export interface JsonSchemaProperty {
   items?: JsonSchemaProperty;
   enum?: unknown[];
   default?: unknown;
+  examples?: unknown[];
 }
 
 /**

@@ -50,6 +50,7 @@ export const getFieldOptionsFromProperties = (
       hasChildren,
       children: type === 'object' ? property.properties : undefined,
       items: type === 'array' ? property.items : undefined,
+      examples: property.examples,
     };
   });
 };
@@ -118,6 +119,7 @@ export const getFieldOptionAtPath = (schema: JsonSchema, path: string): FieldOpt
       hasChildren,
       children: type === 'object' ? property.properties : undefined,
       items: type === 'array' ? property.items : undefined,
+      examples: property.examples,
     };
 
     // Navigate deeper
