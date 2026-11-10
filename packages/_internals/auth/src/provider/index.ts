@@ -373,6 +373,13 @@ export class CompositeAuth
     return merged;
   }
 
+  /** The wrapped provider that authenticated `user`, or undefined when it can't be determined. */
+  getAuthenticatedProvider(user: unknown): IMastraAuthProvider | undefined {
+    return isObjectLike(user)
+      ? this.authenticatedProviderByObject.get(user)
+      : this.authenticatedProviderByPrimitive.get(user as PrimitiveAuthUser);
+  }
+
   /** The wrapped providers, in the order they are tried. */
   getProviders(): readonly IMastraAuthProvider[] {
     return this.providers;
@@ -401,7 +408,7 @@ export class CompositeAuth
    * audience, so the check fails closed.
    */
   async verifyAudience(user: unknown, audience: string): Promise<boolean> {
-    const provider = isObjectLike(user) ? this.authenticatedProviderByObject.get(user) : undefined;
+    const provider = this.getAuthenticatedProvider(user);
     if (!provider) return !this.providers.some(p => typeof p.verifyAudience === 'function');
     if (typeof provider.verifyAudience !== 'function') return true;
     return provider.verifyAudience(user, audience);
