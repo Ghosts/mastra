@@ -16,11 +16,16 @@ const MAX_NESTED_RUN_DEPTH = 16;
 const NESTED_RUN_READ_CONCURRENCY = 8;
 
 /**
- * The nested runs a running step result still drives: its own nested run, or
- * the nested runs of the foreach items that have not finished.
+ * The nested runs a running or suspended step result may still drive: its own
+ * nested run, or the nested runs of the foreach items that have not finished.
+ *
+ * A suspended result counts because a nested run resumed directly runs while
+ * the parent's step result, and a foreach item's output slot, stay `suspended`
+ * until it finishes. A nested run that is still suspended is read for nothing:
+ * it holds no lease and runs no step.
  */
 function runningNestedRunIds(result: { status?: unknown; metadata?: unknown; output?: unknown } | undefined): string[] {
-  if (result?.status !== 'running') {
+  if (result?.status !== 'running' && result?.status !== 'suspended') {
     return [];
   }
 
@@ -32,12 +37,18 @@ function runningNestedRunIds(result: { status?: unknown; metadata?: unknown; out
     return metadata?.nestedRunId ? [metadata.nestedRunId] : [];
   }
 
-  // A foreach item whose output slot is filled finished; an empty or queued slot still runs.
+  // A foreach item whose output slot holds a result finished; an empty, queued or suspended slot
+  // may still run.
   const output = result.output;
   return Object.entries(items)
     .filter(([index]) => {
       const slot = Array.isArray(output) ? output[Number(index)] : undefined;
-      return slot === null || slot === undefined || isQueuedForeachIteration(slot);
+      return (
+        slot === null ||
+        slot === undefined ||
+        isQueuedForeachIteration(slot) ||
+        (slot as { status?: unknown }).status === 'suspended'
+      );
     })
     .map(([, nestedRunId]) => nestedRunId);
 }

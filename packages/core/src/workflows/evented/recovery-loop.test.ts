@@ -25,6 +25,7 @@ import {
   isStepRunAt,
   recordRestarts,
   replicas,
+  restartOutcome,
   runStatus,
   scanning,
   shapes,
@@ -466,6 +467,56 @@ describe('evented recovery loop (#28712)', () => {
 
     // B's loop restarts the run for the crashed branch, without waiting for the sleep.
     await vi.waitFor(() => expect(tracked.executions).toEqual(['A:work', 'B:work']), { timeout: 10_000 });
+  }, 20_000);
+
+  it('leaves a foreach run alone while a suspended item resumed directly still runs', async () => {
+    const storage = new InMemoryStore();
+    const store = (await storage.getStore('workflows'))!;
+    const resumed = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const child = createWorkflow({ id: 'child', inputSchema: Num, outputSchema: Num })
+      .then(
+        createStep({
+          id: 'approve',
+          inputSchema: Num,
+          outputSchema: Num,
+          resumeSchema: z.object({ ok: z.boolean() }),
+          execute: async ({ inputData, resumeData, suspend }) => {
+            if (!resumeData) {
+              return suspend({});
+            }
+
+            resumed.resolve();
+            await finish.promise;
+            return inputData;
+          },
+        }),
+      )
+      .commit();
+    const parent = createWorkflow({ id: 'leased', inputSchema: z.array(Num), outputSchema: z.any() })
+      .foreach(child, { concurrency: 2 })
+      .commit();
+    const a = await startReplica(storage, parent as unknown as Built, {
+      nested: { child } as unknown as Record<string, Built>,
+      recovery: { ...scanning, workflowStallThresholdMs: 300 },
+    });
+    const run = await a.workflow.createRun();
+    expect((await run.start({ inputData: [{ n: 1 }, { n: 2 }] as any })).status).toBe('suspended');
+    const stored = await store.loadWorkflowSnapshot({ workflowName: 'leased', runId: run.runId });
+    const childRunId = (stored?.context.child as any).metadata.foreachNestedRunIds[0] as string;
+    const restarts = await recordRestarts(storage, run.runId);
+
+    // The item's resume sets the parent `running`, while the parent's foreach and its slot stay
+    // `suspended` until the item finishes.
+    const resume = (await child.createRun({ runId: childRunId })).resume({ resumeData: { ok: true } });
+    await resumed.promise;
+    // Long past the parent's own liveness and the stall threshold; only the item keeps it live.
+    await sleep(WORKFLOW_RUN_LEASE_TTL_MS * 3);
+    expect(restarts).toEqual([]);
+    expect((await restartOutcome(a, run.runId)).id).toBe('WORKFLOW_RESTART_RUN_OWNED');
+
+    finish.resolve();
+    expect((await resume).status).toBe('success');
   }, 20_000);
 
   it('restarts no other run when a restart() starts the workers of an instance that never called startWorkers()', async () => {
