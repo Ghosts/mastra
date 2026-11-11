@@ -12,8 +12,6 @@ The loop checks storage every `recovery.workflowScanIntervalMs` (60 seconds by d
 - a default-engine run one lease TTL after its lease expired
 - a run that no instance keeps alive and that wasn't written for `recovery.workflowStallThresholdMs` (5 minutes by default), such as an evented run whose next step message was lost
 
-The first pass of an instance also restarts sleeping evented runs whose process stopped, as the boot-time restart did before. With the default in-process pubsub it also restarts evented runs waiting for their next step message, since those messages died with their process. An instance on that pubsub marks its evented runs as no longer driven when `shutdown()` runs, so the next pass of any instance restarts them at once, even within one lease TTL of the shutdown. Later passes leave sleeping runs alone. After an outage of every instance, an evented run waiting for its next step message on a broker that keeps messages is restarted only once `recovery.workflowStallThresholdMs` passed, not at boot. The loop restarts each run once even when several instances find it at the same time, and stops on `stopWorkers()` and `shutdown()`. `stopWorkers()` also drops the restarts still waiting for a recovery slot. A live evented nested run is no longer cancelled when its parent already ended; it is cancelled once its liveness lapses.
-
 ```ts
 export const mastra = new Mastra({
   recovery: {
@@ -23,12 +21,20 @@ export const mastra = new Mastra({
 });
 ```
 
-`mastra.restartAllActiveWorkflowRuns()` keeps restarting every active run no instance keeps alive. Pass `{ mode: 'orphaned' }` to apply the loop's rules instead, as the server now does at boot. A run another instance still holds is no longer checked again by the call itself. An instance that runs workers checks that run again on its recovery loop. An instance without workers doesn't check it again.
+The first pass of an instance also restarts sleeping evented runs whose process stopped, as the boot-time restart did before; later passes leave sleeping runs alone. With the default in-process pubsub, the first pass also restarts evented runs waiting for their next step message, since those messages died with their process. An instance on that pubsub marks its evented runs as no longer driven when `shutdown()` runs, so the next pass of any instance restarts them at once instead of waiting for their lease to expire.
+
+After an outage of every instance, an evented run waiting for its next step message on a broker that keeps messages is restarted once `recovery.workflowStallThresholdMs` passed, not at boot.
+
+The loop restarts each run once even when several instances find it at the same time. It stops on `stopWorkers()` and `shutdown()`, and `stopWorkers()` also drops the restarts still waiting for a recovery slot.
+
+`mastra.restartAllActiveWorkflowRuns()` keeps restarting every active run no instance keeps alive. Pass `{ mode: 'orphaned' }` to apply the loop's rules instead, as the server now does at boot. A run another instance still holds is no longer checked again by the call itself: an instance that runs workers checks it again on its recovery loop, and an instance without workers doesn't.
 
 ```ts
 await mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
 ```
 
-A restart of an evented step that crashed during a retry continues the attempt count instead of starting its attempts over.
+Other changes:
 
-The in-memory store now moves a run's `updatedAt` on every write to the run, as the database stores do. The recovery loop reads it to find stalled runs.
+- A restart of an evented step that crashed during a retry continues the attempt count instead of starting its attempts over.
+- An evented nested run that is still running is no longer cancelled when its parent already ended. It is cancelled once no instance keeps it alive.
+- The in-memory store now moves a run's `updatedAt` on every write to the run, as the database stores do. The recovery loop reads it to find stalled runs.
