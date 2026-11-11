@@ -7,6 +7,7 @@ import { Mastra } from '../../mastra';
 import { MockStore } from '../../storage/mock';
 import { runLivenessKey } from './leases';
 import { abandonLease } from './test-utils/abandon-lease';
+import { forgetWakeTime } from './test-utils/forget-wake-time';
 import { createStep, createWorkflow } from '.';
 
 /**
@@ -109,66 +110,107 @@ async function startSleepingRun({
   return workflowsStore;
 }
 
-// With an in-process pubsub the boot pass restarts a run whose liveness lapsed before it checks for a
-// sleep, so only the broker-like pubsub exercises the sleep rule.
+// The sleep rules come before the in-process pubsub's boot rule, so both pubsubs exercise them.
 const pubsubs = [
   ['an in-process pubsub', () => new EventEmitterPubSub()],
   ['a pubsub shared across processes', () => new BrokerLikePubSub()],
 ] as const;
+const sleeps = [
+  ['sleep', false],
+  ['sleepUntil', true],
+] as const;
 
 describe('evented workflow durable sleep recovery', () => {
-  it.each(pubsubs)(
-    'replays a sleeping path after restart without rerunning completed work, with %s',
-    async (_, pubsub) => {
+  // The boot pass of a server whose sleeping run's process stopped, as after a deploy.
+  describe.each(pubsubs)('boot pass with %s', (_, pubsub) => {
+    it.each(sleeps)(
+      'replays a %s stored without its end time, without rerunning completed work',
+      async (kind, until) => {
+        const storage = new MockStore();
+        const beforeSleep = vi.fn(async () => ({ value: 'persist me' }));
+        const afterSleep = vi.fn(async ({ inputData }: { inputData: { value: string } }) => inputData);
+        const workflow = createSleepingWorkflow({
+          id: `legacy-${kind}`,
+          duration: 1_000,
+          beforeSleep,
+          afterSleep,
+          until,
+        });
+        const runId = `legacy-${kind}-run`;
+        const workflowsStore = await startSleepingRun({ storage, workflow, runId });
+        await forgetWakeTime(storage, workflow.id, runId);
+        const replacementRuntime = new Mastra({
+          logger: false,
+          storage,
+          pubsub: pubsub(),
+          workflows: { [workflow.id]: workflow },
+        });
+        await replacementRuntime.startWorkers();
+        await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
+
+        // The call returns once the restart is handed to the workers; the replayed sleep still runs out.
+        await vi.waitFor(
+          async () => {
+            const snapshot = await workflowsStore?.loadWorkflowSnapshot({ workflowName: workflow.id, runId });
+            expect(snapshot?.status).toBe('success');
+          },
+          { timeout: 10_000 },
+        );
+        expect(beforeSleep).toHaveBeenCalledTimes(1);
+        expect(afterSleep).toHaveBeenCalledTimes(1);
+        await replacementRuntime.stopWorkers();
+      },
+    );
+
+    it.each(sleeps)('leaves a %s whose stored end time is not due yet for a later check', async (kind, until) => {
       const storage = new MockStore();
       const beforeSleep = vi.fn(async () => ({ value: 'persist me' }));
       const afterSleep = vi.fn(async ({ inputData }: { inputData: { value: string } }) => inputData);
-      const workflow = createSleepingWorkflow({
-        id: 'sleep-restart-workflow',
-        duration: 5_000,
-        beforeSleep,
-        afterSleep,
-      });
-      const workflowsStore = await startSleepingRun({ storage, workflow, runId: 'sleep-restart-run' });
+      const workflow = createSleepingWorkflow({ id: `timed-${kind}`, duration: 5_000, beforeSleep, afterSleep, until });
+      const runId = `timed-${kind}-run`;
+      const workflowsStore = await startSleepingRun({ storage, workflow, runId });
+      const createRun = vi.spyOn(workflow, 'createRun');
       const replacementRuntime = new Mastra({
         logger: false,
         storage,
         pubsub: pubsub(),
         workflows: { [workflow.id]: workflow },
       });
-      // Boots like a server: the boot pass restarts a sleeping run whose process stopped.
       await replacementRuntime.startWorkers();
       await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
 
-      // The sweep returns once the restart is handed to the workers; the replayed sleep still runs out.
-      await vi.waitFor(
-        async () => {
-          const snapshot = await workflowsStore?.loadWorkflowSnapshot({
-            workflowName: workflow.id,
-            runId: 'sleep-restart-run',
-          });
-          expect(snapshot?.status).toBe('success');
-        },
-        { timeout: 10_000 },
-      );
-      expect(beforeSleep).toHaveBeenCalledTimes(1);
-      expect(afterSleep).toHaveBeenCalledTimes(1);
+      expect(createRun).not.toHaveBeenCalled();
+      const snapshot = await workflowsStore?.loadWorkflowSnapshot({ workflowName: workflow.id, runId });
+      expect(snapshot?.status).toBe('running');
+      expect(afterSleep).not.toHaveBeenCalled();
       await replacementRuntime.stopWorkers();
-    },
-  );
+    });
+  });
 
-  it.each(['listWorkflowRuns', 'getRunOwnerships'] as const)(
-    'replays a sleeping path on the next pass when %s failed during the boot pass',
-    async method => {
+  it.each([
+    ['listWorkflowRuns', true],
+    ['getRunOwnerships', true],
+    ['listWorkflowRuns', false],
+    ['getRunOwnerships', false],
+  ] as const)(
+    'applies the boot rules on the next pass when %s failed during the boot pass, to a sleep stored without its end time: %s',
+    async (method, legacy) => {
       const storage = new MockStore();
       const afterSleep = vi.fn(async ({ inputData }: { inputData: { value: string } }) => inputData);
       const workflow = createSleepingWorkflow({
         id: 'sleep-boot-retry-workflow',
-        duration: 5_000,
+        duration: legacy ? 1_000 : 5_000,
         beforeSleep: async () => ({ value: 'persist me' }),
         afterSleep,
       });
       const workflowsStore = (await startSleepingRun({ storage, workflow, runId: 'sleep-boot-retry-run' }))!;
+      if (legacy) {
+        await forgetWakeTime(storage, workflow.id, 'sleep-boot-retry-run');
+        // A retried boot pass only treats runs last written before the boot pass started.
+        const writtenAt = Date.now();
+        await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(writtenAt));
+      }
+      const createRun = vi.spyOn(workflow, 'createRun');
       const status = async () =>
         (await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId: 'sleep-boot-retry-run' }))
           ?.status;
@@ -197,8 +239,15 @@ describe('evented workflow durable sleep recovery', () => {
       expect(await status()).toBe('running');
 
       await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
-      await vi.waitFor(async () => expect(await status()).toBe('success'), { timeout: 10_000 });
-      expect(afterSleep).toHaveBeenCalledTimes(1);
+      if (legacy) {
+        // The retried boot pass replays a sleep stored without its end time.
+        await vi.waitFor(async () => expect(await status()).toBe('success'), { timeout: 10_000 });
+        expect(afterSleep).toHaveBeenCalledTimes(1);
+      } else {
+        // A sleep with a stored end time that is not due is left to its timer on every pass.
+        expect(createRun).not.toHaveBeenCalled();
+        expect(await status()).toBe('running');
+      }
       await replacementRuntime.stopWorkers();
     },
   );
@@ -206,7 +255,8 @@ describe('evented workflow durable sleep recovery', () => {
   describe('a sleeping run that waits for a recovery slot during the boot pass', () => {
     /**
      * Two sleeping runs whose process stopped, and a replacement with one recovery slot whose boot
-     * pass restarts one run while the other waits. `whileQueued` runs while the other waits.
+     * pass restarts one run while the other waits. `whileQueued` runs while the other waits. The
+     * sleeps are stored without their end time, the only ones the boot pass restarts.
      */
     async function bootWithOneSlot(whileQueued: (queued: { runId: string; store: any }) => Promise<void>) {
       const storage = new MockStore();
@@ -218,6 +268,11 @@ describe('evented workflow durable sleep recovery', () => {
       });
       const store = (await startSleepingRun({ storage, workflow, runId: 'sleep-slot-run-1' }))!;
       await startSleepingRun({ storage, workflow, runId: 'sleep-slot-run-2' });
+      await forgetWakeTime(storage, workflow.id, 'sleep-slot-run-1');
+      await forgetWakeTime(storage, workflow.id, 'sleep-slot-run-2');
+      // A retried boot pass only treats runs last written before the boot pass started.
+      const writtenAt = Date.now();
+      await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(writtenAt));
       const replacementRuntime = new Mastra({
         logger: false,
         storage,
@@ -275,43 +330,6 @@ describe('evented workflow durable sleep recovery', () => {
       expect(restarted).toContain(queued);
       await replacementRuntime.stopWorkers();
     });
-  });
-
-  it.each(pubsubs)('replays a sleepUntil path after restart, with %s', async (_, pubsub) => {
-    const storage = new MockStore();
-    const beforeSleep = vi.fn(async () => ({ value: 'persist me' }));
-    const afterSleep = vi.fn(async ({ inputData }: { inputData: { value: string } }) => inputData);
-    const workflow = createSleepingWorkflow({
-      id: 'sleep-until-restart-workflow',
-      duration: 5_000,
-      beforeSleep,
-      afterSleep,
-      until: true,
-    });
-    const workflowsStore = await startSleepingRun({ storage, workflow, runId: 'sleep-until-restart-run' });
-
-    const replacementRuntime = new Mastra({
-      logger: false,
-      storage,
-      pubsub: pubsub(),
-      workflows: { [workflow.id]: workflow },
-    });
-    await replacementRuntime.startWorkers();
-    await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
-
-    await vi.waitFor(
-      async () => {
-        const snapshot = await workflowsStore?.loadWorkflowSnapshot({
-          workflowName: workflow.id,
-          runId: 'sleep-until-restart-run',
-        });
-        expect(snapshot?.status).toBe('success');
-      },
-      { timeout: 10_000 },
-    );
-    expect(beforeSleep).toHaveBeenCalledTimes(1);
-    expect(afterSleep).toHaveBeenCalledTimes(1);
-    await replacementRuntime.stopWorkers();
   });
 
   it.each(pubsubs)('does not restart evented runs when autoRestartActiveRuns is false, with %s', async (_, pubsub) => {

@@ -15,6 +15,7 @@ import { EventEmitterPubSub } from '../../events/event-emitter';
 import type { PubSub } from '../../events/pubsub';
 import type { Event } from '../../events/types';
 import { Mastra } from '../../mastra';
+import type { MastraRecoveryConfig } from '../../mastra';
 import { InMemoryStore } from '../../storage/mock';
 import { WORKFLOW_RUN_LEASE_TTL_MS } from '../run-ownership';
 import { runLivenessKey, stepOccurrenceKey } from './leases';
@@ -30,6 +31,7 @@ import {
   scanning,
   shapes,
   sleep,
+  sleepingWorkflows,
   startReplica,
   stopReplicas,
   track,
@@ -425,49 +427,60 @@ describe('evented recovery loop (#28712)', () => {
     20_000,
   );
 
-  it('restarts a parallel run whose branch crashed mid-step while its other branch sleeps for a day', async () => {
-    const storage = new InMemoryStore();
-    const store = (await storage.getStore('workflows'))!;
-    const tracked = track({ blocks: ['work'] }, { hangForever: true });
-    const build = (report: Report) => {
-      const sleeper = createWorkflow({ id: 'sleeper', inputSchema: Num, outputSchema: Num })
-        .sleep(24 * 60 * 60 * 1000)
-        .commit();
-      const worker = createWorkflow({ id: 'worker', inputSchema: Num, outputSchema: Num })
-        .then(work('work', report))
-        .commit();
-      return {
-        parent: createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: z.any() })
-          .parallel([sleeper, worker])
-          .commit() as unknown as Built,
-        nested: { sleeper, worker } as unknown as Record<string, Built>,
+  it.each([
+    { by: "B's recovery loop", recovery: scanning as MastraRecoveryConfig, sweep: false },
+    { by: "B's restartAllActiveWorkflowRuns({ mode: 'all' })", recovery: { workflows: 'off' } as const, sweep: true },
+  ])(
+    '$by restarts a parallel run whose branch crashed mid-step while its other branch sleeps for a day',
+    async ({ recovery, sweep }) => {
+      const storage = new InMemoryStore();
+      const store = (await storage.getStore('workflows'))!;
+      const tracked = track({ blocks: ['work'] }, { hangForever: true });
+      const build = (report: Report) => {
+        const sleeper = createWorkflow({ id: 'sleeper', inputSchema: Num, outputSchema: Num })
+          .sleep(24 * 60 * 60 * 1000)
+          .commit();
+        const worker = createWorkflow({ id: 'worker', inputSchema: Num, outputSchema: Num })
+          .then(work('work', report))
+          .commit();
+        return {
+          parent: createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: z.any() })
+            .parallel([sleeper, worker])
+            .commit() as unknown as Built,
+          nested: { sleeper, worker } as unknown as Record<string, Built>,
+        };
       };
-    };
-    const onA = build(tracked.reporter('A'));
-    const onB = build(tracked.reporter('B'));
-    const a = await startReplica(storage, onA.parent, { nested: onA.nested });
-    await startReplica(storage, onB.parent, { nested: onB.nested, recovery: scanning });
-    const run = await a.workflow.createRun();
-    void run.start({ inputData: { n: 1 } });
-    await tracked.allBlocked;
-    const nestedRunId = async (stepId: string) =>
-      ((await store.loadWorkflowSnapshot({ workflowName: 'leased', runId: run.runId }))?.context[stepId] as any)
-        ?.metadata?.nestedRunId as string;
-    await vi.waitFor(async () => expect(await nestedRunId('sleeper')).toBeTruthy());
-    const workerRunId = await nestedRunId('worker');
-    const sleeperRunId = await nestedRunId('sleeper');
+      const onA = build(tracked.reporter('A'));
+      const onB = build(tracked.reporter('B'));
+      const a = await startReplica(storage, onA.parent, { nested: onA.nested });
+      const b = await startReplica(storage, onB.parent, { nested: onB.nested, recovery });
+      const run = await a.workflow.createRun();
+      void run.start({ inputData: { n: 1 } });
+      await tracked.allBlocked;
+      const nestedRunId = async (stepId: string) =>
+        ((await store.loadWorkflowSnapshot({ workflowName: 'leased', runId: run.runId }))?.context[stepId] as any)
+          ?.metadata?.nestedRunId as string;
+      await vi.waitFor(async () => expect(await nestedRunId('sleeper')).toBeTruthy());
+      const workerRunId = await nestedRunId('worker');
+      const sleeperRunId = await nestedRunId('sleeper');
 
-    // A crashes while its worker branch runs a step and its sleeper branch sleeps.
-    await crash(a, storage, [
-      stepOccurrenceKey(workerRunId, [0]),
-      runLivenessKey(workerRunId),
-      runLivenessKey(sleeperRunId),
-      runLivenessKey(run.runId),
-    ]);
+      // A crashes while its worker branch runs a step and its sleeper branch sleeps.
+      await crash(a, storage, [
+        stepOccurrenceKey(workerRunId, [0]),
+        runLivenessKey(workerRunId),
+        runLivenessKey(sleeperRunId),
+        runLivenessKey(run.runId),
+      ]);
 
-    // B's loop restarts the run for the crashed branch, without waiting for the sleep.
-    await vi.waitFor(() => expect(tracked.executions).toEqual(['A:work', 'B:work']), { timeout: 10_000 });
-  }, 20_000);
+      // B restarts the run for the crashed branch, without waiting for the sleep.
+      if (sweep) {
+        await b.mastra.restartAllActiveWorkflowRuns({ mode: 'all' });
+      }
+
+      await vi.waitFor(() => expect(tracked.executions).toEqual(['A:work', 'B:work']), { timeout: 10_000 });
+    },
+    20_000,
+  );
 
   it('leaves a foreach run alone while a suspended item resumed directly still runs', async () => {
     const storage = new InMemoryStore();
@@ -586,37 +599,6 @@ describe('evented recovery loop (#28712)', () => {
     // The run's liveness lapsed a lease TTL after the first step, long before the threshold.
     expect(tracked.at['A:second']).toBeGreaterThanOrEqual(lastWrite + stallMs);
   }, 20_000);
-
-  /** Steps `before` and `after` around a two-second sleep, and the nested workflows to register. */
-  const sleepingWorkflows = {
-    sleep: (report: Report) => ({
-      workflow: createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num })
-        .then(work('before', report))
-        .sleep(2_000)
-        .then(work('after', report))
-        .commit(),
-      nested: {},
-    }),
-    sleepUntil: (report: Report) => ({
-      workflow: createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num })
-        .then(work('before', report))
-        .sleepUntil(new Date(Date.now() + 2_000))
-        .then(work('after', report))
-        .commit(),
-      nested: {},
-    }),
-    'sleep of a nested workflow': (report: Report) => {
-      const child = createWorkflow({ id: 'child', inputSchema: Num, outputSchema: Num })
-        .then(work('before', report))
-        .sleep(2_000)
-        .then(work('after', report))
-        .commit();
-      return {
-        workflow: createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: z.any() }).then(child).commit(),
-        nested: { child },
-      };
-    },
-  };
 
   it.each(Object.keys(sleepingWorkflows) as (keyof typeof sleepingWorkflows)[])(
     'leaves a run in a %s to the replica that wakes it',

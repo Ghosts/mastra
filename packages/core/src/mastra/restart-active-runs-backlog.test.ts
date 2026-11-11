@@ -8,23 +8,16 @@ vi.hoisted(() => {
   process.env.MASTRA_AGENT_THREAD_LEASE_TTL_MS = '600';
 });
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { z } from 'zod/v4';
+import { describe, expect, it, vi } from 'vitest';
 import { EventEmitterPubSub } from '../events/event-emitter';
 import type { PubSub } from '../events/pubsub';
 import type { Event } from '../events/types';
 import { InMemoryStore } from '../storage/mock';
-import { createEmptyWorkflowSnapshot } from '../storage/workflow-snapshot';
-import { createStep, createWorkflow } from '../workflows/evented';
 import { restartLeaseKey } from '../workflows/evented/leases';
 import { WORKFLOW_RUN_LEASE_TTL_MS } from '../workflows/run-ownership';
-import { Mastra } from './index';
+import { persistActiveRun, useRecoveredReplicas } from './test-utils/recovered-runs';
 
-const replicas: Mastra[] = [];
-afterEach(async () => {
-  vi.restoreAllMocks();
-  await Promise.all(replicas.splice(0).map(mastra => mastra.shutdown({ drainTimeout: 0 })));
-});
+const createReplica = useRecoveredReplicas();
 
 /**
  * A pubsub whose broker accepts `workflow.start` events at once but delivers them `delayMs` later,
@@ -53,40 +46,11 @@ function backloggedPubSub(delayMs: number | 'never'): PubSub {
   });
 }
 
-/** A replica whose `recovered-wf` step records `<replica>:<runId>`. */
+/** An evented replica, its workers started, whose `recovered-wf` step records `<replica>:<runId>`. */
 async function startReplica(storage: InMemoryStore, name: string, executions: string[], pubsub?: PubSub) {
-  const workflow = createWorkflow({ id: 'recovered-wf', inputSchema: z.object({}), outputSchema: z.object({}) })
-    .then(
-      createStep({
-        id: 'work',
-        inputSchema: z.object({}),
-        outputSchema: z.object({}),
-        execute: async ({ runId }) => {
-          executions.push(`${name}:${runId}`);
-          return {};
-        },
-      }),
-    )
-    .commit();
-  const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { 'recovered-wf': workflow } });
+  const mastra = createReplica(storage, 'evented', runId => void executions.push(`${name}:${runId}`), { pubsub });
   await mastra.startWorkers();
-  replicas.push(mastra);
   return mastra;
-}
-
-/** Stores a `running` run of `recovered-wf` that stopped before its first step, as a crash leaves it. */
-async function persistActiveRun(storage: InMemoryStore, runId: string) {
-  const store = (await storage.getStore('workflows'))!;
-  await store.persistWorkflowSnapshot({
-    workflowName: 'recovered-wf',
-    runId,
-    snapshot: {
-      ...createEmptyWorkflowSnapshot(runId),
-      status: 'running',
-      activePaths: [],
-      context: { input: {} } as any,
-    },
-  });
 }
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));

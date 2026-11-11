@@ -3,71 +3,12 @@
  * another process keeps alive before loading them (#28712). Each replica is a
  * Mastra instance sharing one store, the way pods share one database.
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { z } from 'zod/v4';
+import { describe, expect, it, vi } from 'vitest';
 import { InMemoryStore } from '../storage/mock';
-import { createEmptyWorkflowSnapshot } from '../storage/workflow-snapshot';
-import { createStep, createWorkflow } from '../workflows';
-import type { WorkflowRunStatus } from '../workflows';
-import { createStep as createEventedStep, createWorkflow as createEventedWorkflow } from '../workflows/evented';
 import { runLivenessKey } from '../workflows/evented/leases';
-import { Mastra } from './index';
+import { persistActiveRun, useRecoveredReplicas } from './test-utils/recovered-runs';
 
-type Engine = 'default' | 'evented';
-
-const replicas: Mastra[] = [];
-afterEach(async () => {
-  vi.restoreAllMocks();
-  await Promise.all(replicas.splice(0).map(mastra => mastra.shutdown({ drainTimeout: 0 })));
-});
-
-/** A replica whose `recovered-wf` workflow runs one step that calls `execute` with the run id. */
-function startReplica(
-  storage: InMemoryStore,
-  engine: Engine,
-  execute: (runId: string) => void | Promise<void>,
-  recovery?: { workflowConcurrency?: number },
-) {
-  const [create, step] =
-    engine === 'evented'
-      ? ([createEventedWorkflow, createEventedStep] as const)
-      : ([createWorkflow, createStep] as const);
-  const workflow = (create as typeof createWorkflow)({
-    id: 'recovered-wf',
-    inputSchema: z.object({}),
-    outputSchema: z.object({}),
-  })
-    .then(
-      (step as typeof createStep)({
-        id: 'work',
-        inputSchema: z.object({}),
-        outputSchema: z.object({}),
-        execute: async ({ runId }) => {
-          await execute(runId);
-          return {};
-        },
-      }),
-    )
-    .commit();
-  const mastra = new Mastra({ logger: false, storage, workflows: { 'recovered-wf': workflow }, recovery });
-  replicas.push(mastra);
-  return mastra;
-}
-
-/** Stores a run its process left `status` before its first step finished, as a crash leaves it. */
-async function persistActiveRun(
-  storage: InMemoryStore,
-  runId: string,
-  { updatedAt, status = 'running' }: { updatedAt?: Date; status?: WorkflowRunStatus } = {},
-) {
-  const store = (await storage.getStore('workflows'))!;
-  await store.persistWorkflowSnapshot({
-    workflowName: 'recovered-wf',
-    runId,
-    updatedAt,
-    snapshot: { ...createEmptyWorkflowSnapshot(runId), status, activePaths: [], context: { input: {} } as any },
-  });
-}
+const createReplica = useRecoveredReplicas();
 
 /** Counts how often each run's snapshot is loaded. */
 async function countLoads(storage: InMemoryStore) {
@@ -100,7 +41,7 @@ describe('boot-time workflow recovery sweep (#28712)', () => {
       const storage = new InMemoryStore();
       const store = (await storage.getStore('workflows'))!;
       const executions: string[] = [];
-      const mastra = startReplica(storage, engine, runId => void executions.push(runId));
+      const mastra = createReplica(storage, engine, runId => void executions.push(runId));
 
       // More live runs than the sweep handles per batch (a hundred). The process driving them keeps
       // their lease fresh: evented workers through the run's liveness key, a default-engine run
@@ -127,7 +68,7 @@ describe('boot-time workflow recovery sweep (#28712)', () => {
     const storage = new InMemoryStore();
     const store = (await storage.getStore('workflows'))!;
     const executions: string[] = [];
-    const mastra = startReplica(storage, 'default', runId => void executions.push(runId));
+    const mastra = createReplica(storage, 'default', runId => void executions.push(runId));
     // Orphaned runs finish while the sweep still works through later batches. Runs another
     // process drives stay active.
     const runIds = Array.from({ length: 300 }, (_, i) => `run-${i}`);
@@ -157,7 +98,7 @@ describe('boot-time workflow recovery sweep (#28712)', () => {
   it('restarts a run once when it moves from running to waiting between the two listings', async () => {
     const storage = new InMemoryStore();
     const store = (await storage.getStore('workflows'))!;
-    const mastra = startReplica(storage, 'default', () => {});
+    const mastra = createReplica(storage, 'default', () => {});
     const runIds = Array.from({ length: 150 }, (_, i) => `run-${i}`);
     for (const runId of runIds) {
       await persistActiveRun(storage, runId);
@@ -200,7 +141,7 @@ describe('boot-time workflow recovery sweep (#28712)', () => {
   it('restarts a waiting run that becomes running while the sweep restarts the running runs', async () => {
     const storage = new InMemoryStore();
     const store = (await storage.getStore('workflows'))!;
-    const mastra = startReplica(storage, 'default', () => {});
+    const mastra = createReplica(storage, 'default', () => {});
     await persistActiveRun(storage, 'running-run');
     await persistActiveRun(storage, 'woken-run', { status: 'waiting' });
 
@@ -229,14 +170,14 @@ describe('boot-time workflow recovery sweep (#28712)', () => {
     const started: string[] = [];
     let finish!: () => void;
     const finished = new Promise<void>(resolve => (finish = resolve));
-    const mastra = startReplica(
+    const mastra = createReplica(
       storage,
       'evented',
       async runId => {
         started.push(runId);
         await finished;
       },
-      { workflowConcurrency: 1 },
+      { recovery: { workflowConcurrency: 1 } },
     );
     const runIds = ['orphaned-a', 'orphaned-b', 'orphaned-c'];
     for (const runId of runIds) {
