@@ -4777,7 +4777,8 @@ export class Mastra<
    *   loop) renews again within that grace. A released lease on a `running` run is a resume or
    *   time travel that has not taken the lease yet, or one that crashed in between; it gets the
    *   same grace from the run's last write, or the stall rule while a step is suspended (a
-   *   nested run being resumed keeps its parent `running` without a lease until it finishes).
+   *   nested run resumed directly sets its parent `running` before it takes the parent's lease,
+   *   and leaves it so if its process stops in between).
    *   The grace compares this process's clock with the store's `leaseExpiresAt`, so a clock skew
    *   between them shortens or lengthens it by that skew.
    * - A run restarted by none of the rules above is restarted once it has not been written for

@@ -5827,6 +5827,8 @@ export class Run<
       | {
           run: Run<any, any, any, any, any, any>;
           snapshot: WorkflowRunState;
+          /** Releases the parent's run lease held while this run executes. */
+          releaseLease: () => Promise<void>;
         }
       | undefined;
 
@@ -5865,11 +5867,24 @@ export class Run<
         await releaseClaimIfUnused();
         throw error;
       }
-      claimedParent = { run: parentRun, snapshot: parentSnapshot };
+      // The parent is `running` while this run executes, so it holds its run lease meanwhile: the
+      // recovery loop must not restart it, and with it this run's step, while this run still works.
+      const parentLease = await parentRun.#claimOwnership(true).catch(error => {
+        this.#mastra?.getLogger()?.warn(`[Workflow ${this.workflowId}] Failed to claim the parent run's lease`, error);
+        return undefined;
+      });
+      claimedParent = {
+        run: parentRun,
+        snapshot: parentSnapshot,
+        releaseLease: async () => {
+          if (parentLease && 'release' in parentLease) await parentLease.release().catch(() => {});
+        },
+      };
     }
 
     const releaseParentClaim = async () => {
       if (!claimedParent) return;
+      await claimedParent.releaseLease();
       try {
         await claimedParent.run.runStorage.updateHeader({ status: 'suspended', expectedStatus: 'running' });
       } catch (releaseError) {
@@ -5928,6 +5943,8 @@ export class Run<
         if (result.status === 'success') {
           if (claimedParent && this.parentWorkflow) {
             let parentExecutionStarted = false;
+            // The parent's resume takes its lease over right away.
+            await claimedParent.releaseLease();
             void claimedParent.run
               ._resume({
                 step: this.parentWorkflow.stepId,
