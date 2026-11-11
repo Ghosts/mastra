@@ -192,6 +192,9 @@ describe('Postgres evented occurrence replay', () => {
             ? driver.events.find(event => event.type === 'workflow.step.end' && event.data.workflowId === body.id)!
             : driver.stepRuns({ spec: '0', runId: run.runId })[0]!;
         interrupted.mockRestore();
+        // The worker died: the body's step lease lapses. This live process could still be releasing
+        // it, and a release makes a delivery waiting on it drop the occurrence as handled.
+        await abandonLease(storage, stepOccurrenceKey(run.runId, [0], 0));
         const leaseKey = `workflow-step-run:${original.runId}:${original.id}`;
         await driver.pubsub.releaseLease(leaseKey, (await driver.pubsub.getLeaseOwner(leaseKey))!);
         await driver.redeliverEvent(original);
