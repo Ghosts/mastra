@@ -464,6 +464,8 @@ const workItemListQuerySchema = z
     sessionId: z.array(sessionSchema.shape.sessionId).optional(),
     /** `sessions` narrows the list to the cards that hold any session and the cards related to them. */
     scope: z.enum(['sessions']).optional(),
+    /** The `cursor` of the whole board this reader holds: the answer is then what moved since. */
+    since: z.string().optional(),
   })
   .refine(query => !(query.scope && query.sessionId), {
     path: ['scope'],
@@ -1020,9 +1022,16 @@ export const FACTORY_ROUTE_CONTRACTS = {
     pathSchema: projectPathSchema,
     querySchema: workItemListQuerySchema,
     responseSchema: z.object({
+      /** Every listed card, or with `removedIds` only the cards changed since the `since` sent. */
       workItems: z.array(cardSchema),
       runningSessionIds: z.array(z.string()),
       parkedSessionIds: z.array(z.string()),
+      /** Names this read of the whole board. Absent when the next read must list it whole again. */
+      cursor: z.string().optional(),
+      /** Cards gone since the `since` sent. Its presence marks an answer that holds only what moved. */
+      removedIds: z.array(z.string()).optional(),
+      /** With `removedIds`: how many cards the board holds, for a reader to check its copy against. */
+      total: z.number().optional(),
     }),
   },
   workItemCreate: {

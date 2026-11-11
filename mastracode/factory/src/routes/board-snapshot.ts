@@ -33,9 +33,10 @@ export function boardSnapshot(
   toWire: (item: Card) => unknown,
   runningSessionIds: readonly string[],
   parkedSessionIds: readonly string[],
+  cursor?: string,
 ): BoardSnapshot {
   // Random per cached list, so an ETag from before a restart never matches a different board.
-  return snapshot(items, toWire, runningSessionIds, parkedSessionIds, () => randomUUID());
+  return snapshot(items, toWire, runningSessionIds, parkedSessionIds, () => randomUUID(), cursor);
 }
 
 /**
@@ -58,6 +59,7 @@ function snapshot(
   runningSessionIds: readonly string[],
   parkedSessionIds: readonly string[],
   cardsId: (json: string) => string,
+  cursor?: string,
 ): BoardSnapshot {
   let cards = cardsJson.get(items);
   if (!cards) {
@@ -68,7 +70,7 @@ function snapshot(
   const etag = `W/"${cards.id}.${sha1(JSON.stringify([runningSessionIds, parkedSessionIds]))}"`;
   if (cards.latest?.etag === etag) return cards.latest;
 
-  const json = listingJson(cards.json, runningSessionIds, parkedSessionIds);
+  const json = `{"workItems":${cards.json},"runningSessionIds":${JSON.stringify(runningSessionIds)},"parkedSessionIds":${JSON.stringify(parkedSessionIds)}${cursor ? `,"cursor":"${cursor}"` : ''}}`;
   let gzipped: Promise<Buffer> | undefined;
   // zlib runs on the libuv pool, off the event loop.
   cards.latest = { etag, json, gzipped: () => (gzipped ??= gzip(json)) };
@@ -77,10 +79,6 @@ function snapshot(
 
 function sha1(text: string): string {
   return createHash('sha1').update(text).digest('base64url');
-}
-
-function listingJson(cards: string, runningSessionIds: readonly string[], parkedSessionIds: readonly string[]): string {
-  return `{"workItems":${cards},"runningSessionIds":${JSON.stringify(runningSessionIds)},"parkedSessionIds":${JSON.stringify(parkedSessionIds)}}`;
 }
 
 /** Whether an `If-None-Match` header names this ETag (weak comparison, as for GET). */
