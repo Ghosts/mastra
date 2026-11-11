@@ -5466,6 +5466,8 @@ export class Run<
    * Claims the run before `restart()` drives it again from `_snapshot`, the stored run state the
    * restart starts from. Returns a handle that is released once the restarted execution settles,
    * or the current owner when another process still drives the run.
+   *
+   * @internal
    */
   protected async claimRestartOwnership(
     _snapshot: WorkflowRunState,
@@ -5477,6 +5479,8 @@ export class Run<
    * Runs right before a `resume()` or `timeTravel()` caller flips the stored run to `running`,
    * so an engine whose runs are recovered by liveness rather than by a run lease can mark the
    * run live first. A failed claim leaves that mark to lapse on its own.
+   *
+   * @internal
    */
   protected async beforeRunClaim(): Promise<void> {}
 
