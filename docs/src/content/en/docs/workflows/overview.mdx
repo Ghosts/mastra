@@ -596,7 +596,7 @@ if (activeRuns.runs.length > 0) {
 
 :::note
 
-When the Mastra server starts, it restarts orphaned workflow runs with `mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' })`, which applies the [recovery loop](#recovery-loop) rules. On a server that runs no recovery loop, for example one with `workers: false`, the call also restarts runs in a sleep that isn't due yet, since no later check would wake them, and each restart waits only for what's left of the sleep. On storage adapters without run-ownership support, it restarts every active run.
+When the Mastra server starts, it restarts orphaned workflow runs with `mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' })`, which applies the [recovery loop](#recovery-loop) rules. On a server that runs no recovery loop, for example one with `workers: false`, the call also restarts runs in a sleep that isn't due yet, since no later check would wake them, and each restart waits only for what's left of the sleep. A server with `workers: false` doesn't run the restarted runs itself: run the orchestration worker in another process, on a pubsub that delivers to it, such as a broker both processes use. The default in-process pubsub only delivers within the server's own process. On storage adapters without run-ownership support, it restarts every active run.
 
 :::
 
