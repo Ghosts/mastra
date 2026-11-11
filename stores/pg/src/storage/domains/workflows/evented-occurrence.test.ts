@@ -11,6 +11,9 @@ import { abandonLease } from '../../../../../../packages/core/src/workflows/even
 import { RedeliveryDriver } from '../../../../../../packages/core/src/workflows/evented/test-utils/redelivery-driver';
 import { connectionString, TEST_CONFIG } from '../../test-utils';
 
+// The cases redeliver events and restart runs themselves; a recovery pass would race them.
+const manualRecovery = { workflows: 'off' } as const;
+
 describe('Postgres evented occurrence replay', () => {
   const schemaName = `evented_guard_${Date.now()}`;
   const storage = new PostgresStore({ ...TEST_CONFIG, id: 'evented-guard', schemaName });
@@ -44,7 +47,12 @@ describe('Postgres evented occurrence replay', () => {
           }),
         )
         .commit();
-      const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { [workflow.id]: workflow } });
+      const mastra = new Mastra({
+        storage,
+        pubsub: driver.pubsub,
+        recovery: manualRecovery,
+        workflows: { [workflow.id]: workflow },
+      });
       await mastra.startWorkers();
       try {
         const run = await workflow.createRun();
@@ -91,7 +99,12 @@ describe('Postgres evented occurrence replay', () => {
         }),
       )
       .commit();
-    const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { [workflow.id]: workflow } });
+    const mastra = new Mastra({
+      storage,
+      pubsub: driver.pubsub,
+      recovery: manualRecovery,
+      workflows: { [workflow.id]: workflow },
+    });
     await mastra.startWorkers();
     try {
       const run = await workflow.createRun();
@@ -148,7 +161,7 @@ describe('Postgres evented occurrence replay', () => {
           return inputData.n === 3 || conditions.filter(n => n === inputData.n).length > 1;
         })
         .commit();
-      const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { workflow } });
+      const mastra = new Mastra({ storage, pubsub: driver.pubsub, recovery: manualRecovery, workflows: { workflow } });
       const publish = driver.pubsub.publish.bind(driver.pubsub);
       let reached!: () => void;
       const saved = new Promise<void>(resolve => {
@@ -211,7 +224,7 @@ describe('Postgres evented occurrence replay', () => {
     const workflow = createWorkflow({ id: `legacy-loop-${randomUUID()}`, inputSchema: schema, outputSchema: schema })
       .dountil(body, async ({ inputData }) => inputData.n === 3)
       .commit();
-    const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { workflow } });
+    const mastra = new Mastra({ storage, pubsub: driver.pubsub, recovery: manualRecovery, workflows: { workflow } });
     const publish = driver.pubsub.publish.bind(driver.pubsub);
     let legacyWrite = false;
     const olderWorker = vi.spyOn(driver.pubsub, 'publish').mockImplementation(async (topic, event, options) => {
@@ -282,7 +295,12 @@ describe('Postgres evented occurrence replay', () => {
     })
       .dountil(body, async ({ inputData }) => inputData.n >= 2)
       .commit();
-    const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { [workflow.id]: workflow } });
+    const mastra = new Mastra({
+      storage,
+      pubsub: driver.pubsub,
+      recovery: manualRecovery,
+      workflows: { [workflow.id]: workflow },
+    });
     const publish = driver.pubsub.publish.bind(driver.pubsub);
     let swallowed = false;
     const interrupted = vi.spyOn(driver.pubsub, 'publish').mockImplementation(async (topic, event, options) => {
@@ -339,7 +357,12 @@ describe('Postgres evented occurrence replay', () => {
         }),
       )
       .commit();
-    const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { [workflow.id]: workflow } });
+    const mastra = new Mastra({
+      storage,
+      pubsub: driver.pubsub,
+      recovery: manualRecovery,
+      workflows: { [workflow.id]: workflow },
+    });
     await mastra.startWorkers();
     const claim = store.claimRunOwnership.bind(store);
     const refused = Promise.withResolvers<void>();
@@ -393,7 +416,12 @@ describe('Postgres evented occurrence replay', () => {
     const workflow = createWorkflow({ id: `loop-resume-${randomUUID()}`, inputSchema: schema, outputSchema: schema })
       .dountil(body, async ({ inputData }) => inputData.n === 2)
       .commit();
-    const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { [workflow.id]: workflow } });
+    const mastra = new Mastra({
+      storage,
+      pubsub: driver.pubsub,
+      recovery: manualRecovery,
+      workflows: { [workflow.id]: workflow },
+    });
     await mastra.startWorkers();
     try {
       const run = await workflow.createRun();
@@ -468,7 +496,12 @@ describe('Postgres evented occurrence replay', () => {
         .then(first)
         .then(second)
         .commit();
-      const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { [workflow.id]: workflow } });
+      const mastra = new Mastra({
+        storage,
+        pubsub: driver.pubsub,
+        recovery: manualRecovery,
+        workflows: { [workflow.id]: workflow },
+      });
       const publish = driver.pubsub.publish.bind(driver.pubsub);
       let reached!: () => void;
       const saved = new Promise<void>(resolve => {
@@ -622,7 +655,12 @@ describe('Postgres evented occurrence replay', () => {
             : boundary === 'conditional'
               ? builder.branch([[async () => true, second]]).commit()
               : builder.then(second).then(third).commit();
-      const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { [workflow.id]: workflow } });
+      const mastra = new Mastra({
+        storage,
+        pubsub: driver.pubsub,
+        recovery: manualRecovery,
+        workflows: { [workflow.id]: workflow },
+      });
       const store = (await storage.getStore('workflows'))!;
       const persist = store.persistWorkflowSnapshot.bind(store);
       let terminalWriteFailed = false;
@@ -814,7 +852,12 @@ describe('Postgres evented occurrence replay', () => {
       .then(body)
       .then(body)
       .commit();
-    const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { [workflow.id]: workflow } });
+    const mastra = new Mastra({
+      storage,
+      pubsub: driver.pubsub,
+      recovery: manualRecovery,
+      workflows: { [workflow.id]: workflow },
+    });
     const publish = driver.pubsub.publish.bind(driver.pubsub);
     let reached!: () => void;
     const saved = new Promise<void>(resolve => {
@@ -874,7 +917,12 @@ describe('Postgres evented occurrence replay', () => {
         else if (kind === 'foreach') workflow.foreach(pause);
         else workflow.then(kind === 'nested' ? child : pause);
         workflow.commit();
-        const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { [workflow.id]: workflow } });
+        const mastra = new Mastra({
+          storage,
+          pubsub: driver.pubsub,
+          recovery: manualRecovery,
+          workflows: { [workflow.id]: workflow },
+        });
         await mastra.startWorkers();
         try {
           const run = await workflow.createRun();
@@ -926,7 +974,7 @@ describe('Postgres evented occurrence replay', () => {
       if (kind === 'loop') workflow.dountil(increment, async ({ inputData }) => inputData.n === 1);
       else workflow.then(increment);
       workflow.commit();
-      const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { workflow } });
+      const mastra = new Mastra({ storage, pubsub: driver.pubsub, recovery: manualRecovery, workflows: { workflow } });
       const publish = driver.pubsub.publish.bind(driver.pubsub);
       let reached!: () => void;
       const saved = new Promise<void>(resolve => {
@@ -1014,7 +1062,7 @@ describe('Postgres evented occurrence replay', () => {
       .dountil(increment, async ({ inputData }) => inputData.n === 3)
       .then(checkpoint)
       .commit();
-    const mastra = new Mastra({ storage, pubsub: driver.pubsub, workflows: { workflow } });
+    const mastra = new Mastra({ storage, pubsub: driver.pubsub, recovery: manualRecovery, workflows: { workflow } });
     await mastra.startWorkers();
     try {
       const run = await workflow.createRun();

@@ -68,7 +68,14 @@ async function withStepGuards(storage: MockStore) {
 }
 
 async function makeHost(workflows: Record<string, any>, storage: MockStore) {
-  const mastra = new Mastra({ logger: false, storage, workflows, pubsub: new EventEmitterPubSub() });
+  // The test restarts runs itself; a recovery pass would race it.
+  const mastra = new Mastra({
+    logger: false,
+    storage,
+    workflows,
+    pubsub: new EventEmitterPubSub(),
+    recovery: { workflows: 'off' },
+  });
   await mastra.startWorkers();
   hosts.push(mastra);
   return mastra;

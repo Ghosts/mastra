@@ -260,6 +260,8 @@ export function describeFinishedOccurrenceCases({
         logger: false,
         storage: await connect(),
         pubsub,
+        // The cases restart runs and deliver events themselves; a recovery pass would race them.
+        recovery: { workflows: 'off' },
         workflows: { finished: workflow, ...Object.fromEntries(nested) } as unknown as Record<string, Workflow>,
       });
       await mastra.startWorkers();

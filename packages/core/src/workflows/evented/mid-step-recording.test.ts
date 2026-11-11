@@ -61,6 +61,8 @@ async function makeHost(workflow: ReturnType<typeof makeWorkflow>, storage: Inst
     storage,
     workflows: { [workflow.id]: workflow as any },
     pubsub: new EventEmitterPubSub(),
+    // The test restarts runs itself; a recovery pass would race it.
+    recovery: { workflows: 'off' },
   });
   await mastra.startWorkers();
   return mastra;

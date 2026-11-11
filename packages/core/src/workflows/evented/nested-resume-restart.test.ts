@@ -58,6 +58,8 @@ async function makeHost(storage: MockStore, p: ReturnType<typeof build>) {
     storage,
     pubsub: new EventEmitterPubSub(),
     workflows: { parent: p.parent, nested: p.nested },
+    // The test restarts runs itself; a recovery pass would race it.
+    recovery: { workflows: 'off' },
   });
   await mastra.startWorkers();
   return mastra;

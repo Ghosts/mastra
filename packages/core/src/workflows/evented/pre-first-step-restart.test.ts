@@ -34,6 +34,8 @@ async function makeHost(
     storage,
     workflows: { [workflow.id]: workflow as any },
     pubsub,
+    // The test restarts runs itself; a recovery pass would race it.
+    recovery: { workflows: 'off' },
   });
   await mastra.startWorkers();
   hosts.push(mastra);
