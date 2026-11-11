@@ -19,7 +19,7 @@ import { EventEmitterPubSub } from '../../events/event-emitter';
 import type { Event } from '../../events/types';
 import { InMemoryStore } from '../../storage/mock';
 import { WORKFLOW_RUN_LEASE_TTL_MS } from '../run-ownership';
-import { restartLeaseKey, runLivenessKey } from './leases';
+import { restartLeaseKey, runLivenessKey, sleepStartKey } from './leases';
 import { abandonLease } from './test-utils/abandon-lease';
 import {
   Num,
@@ -542,6 +542,46 @@ describe('waking an evented sleep once (#30012)', () => {
       timeout: WORKFLOW_RUN_LEASE_TTL_MS / 2,
     });
     expect(seen.executions).toEqual(['A:before', 'A:after']);
+  }, 20_000);
+
+  it('stops a sleep setup whose start lease another process took while its duration resolved', async () => {
+    const storage = new InMemoryStore();
+    const store = (await storage.getStore('workflows'))!;
+    const seen = observe('leased');
+    const resolving = Promise.withResolvers<void>();
+    const resolve = Promise.withResolvers<void>();
+    const build = (report: Report) =>
+      createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num })
+        .then(work('before', report))
+        .sleep(async () => {
+          resolving.resolve();
+          await resolve.promise;
+          return 50;
+        })
+        .then(work('after', report))
+        .commit() as unknown as Built;
+    const a = await startReplica(storage, build(seen.reporter('A')), {
+      pubsub: seen.pubsub('A'),
+      recovery: { workflows: 'off' },
+    });
+    const run = await a.workflow.createRun();
+    startInBackground(run, { n: 1 });
+    await resolving.promise;
+
+    // Another process takes the start lease over while A's duration function runs, as after A's
+    // renewals failed for a lease TTL, and sets the sleep up itself.
+    await store.claimRunOwnership({
+      runId: sleepStartKey(run.runId, [1]),
+      ownerId: 'another-process',
+      leaseMs: 60_000,
+      force: true,
+    });
+    resolve.resolve();
+    await sleep(300);
+
+    expect(await storedSleeps(storage, run.runId)).toEqual([]);
+    expect(seen.continuations).toEqual([]);
+    expect(seen.executions).toEqual(['A:before']);
   }, 20_000);
 
   it('stops a wake whose workers stopped while it claimed its lease', async () => {

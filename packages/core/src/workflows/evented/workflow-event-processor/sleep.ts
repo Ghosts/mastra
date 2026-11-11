@@ -249,17 +249,21 @@ async function startSleep(
   }
 
   try {
-    await setUpSleep(args, deps, resolveDuration);
+    await setUpSleep(args, deps, resolveDuration, start);
   } finally {
     await start?.release();
   }
 }
 
-/** The part of {@link startSleep} that runs under the sleep's start lease. */
+/**
+ * The part of {@link startSleep} that runs under the sleep's start lease,
+ * `start`; `undefined` when the run's steps run unleased.
+ */
 async function setUpSleep(
   args: ProcessorArgs,
   deps: SleepDeps & { step: SleepEntry },
   resolveDuration: (requestContext: RequestContext) => Promise<number>,
+  start: SleepWakeLease | undefined,
 ) {
   const { workflow, workflowId, runId, executionPath, activeStepsPath, prevResult, requestContext, timeTravel } = args;
   const { pubsub, workflowsStore, leaseStore, step } = deps;
@@ -339,6 +343,19 @@ async function setUpSleep(
     // Only a change is written: a parallel branch may have stored newer state than this delivery's copy.
     if (JSON.stringify(state) !== stateBefore) {
       changedState = state;
+    }
+
+    // The duration function can run for long. A start lease that lapsed meanwhile, its renewals
+    // failing, may have let another delivery set this sleep up, and writing now could put the run
+    // back at a sleep that already woke. Leases are advisory: a setup stalled after this check
+    // can still write.
+    if (start && !(await start.held())) {
+      deps.logger?.debug('Dropping a sleep setup whose start lease another delivery took', {
+        workflowId,
+        runId,
+        executionPath,
+      });
+      return;
     }
   }
 
