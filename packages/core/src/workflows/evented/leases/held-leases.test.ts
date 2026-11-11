@@ -178,4 +178,34 @@ describe('held leases (#28712)', () => {
       vi.useRealTimers();
     }
   });
+
+  it('keeps renewing a restart lease while the renewal of a handed-off step lease never answers', async () => {
+    vi.useFakeTimers();
+    try {
+      const store = (await new InMemoryStore().getStore('workflows'))!;
+      const claim = (runId: string, ownerId: string) =>
+        store.claimRunOwnership({ runId, ownerId, leaseMs: WORKFLOW_RUN_LEASE_TTL_MS });
+      const restart = await claim(restartLeaseKey('restarted'), 'restarter');
+      const step = (await claim(stepOccurrenceKey('retried', [0]), 'worker')).record!;
+      // The store hangs on every renewal of the handed-off step lease.
+      const renew = store.renewRunOwnership.bind(store);
+      vi.spyOn(store, 'renewRunOwnership').mockImplementation(args =>
+        args.runId === step.runId ? new Promise(() => {}) : renew(args),
+      );
+      const endHandOff = holdHandedOffStepLease({
+        scope: { __shuttingDown: false },
+        store,
+        fence: { runId: step.runId, ownerId: step.ownerId, generation: step.generation },
+      });
+      const hold = holdRestartLease({ store, runId: 'restarted', record: restart.record! });
+
+      await vi.advanceTimersByTimeAsync(WORKFLOW_RUN_LEASE_TTL_MS * 2);
+
+      expect((await store.getRunOwnership({ runId: restartLeaseKey('restarted') }))?.live).toBe(true);
+      endHandOff();
+      await hold.release();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
