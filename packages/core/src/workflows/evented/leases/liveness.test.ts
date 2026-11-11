@@ -30,7 +30,7 @@ import {
   work,
 } from '../test-utils/lease-replicas';
 import type { Built, Report } from '../test-utils/lease-replicas';
-import { acquireStepLease, runLivenessKey, stepOccurrenceKey } from '.';
+import { acquireStepLease, restartLeaseKey, runLivenessKey, stepOccurrenceKey } from '.';
 import type { StepLease } from '.';
 
 afterEach(stopReplicas);
@@ -130,24 +130,38 @@ describe('with an in-process pubsub, a run whose next step event was lost while 
       const storage = new InMemoryStore();
       const tracked = track({ blocks: [] });
       const { a, run } = await loseSecondStep(storage, tracked);
+      const store = (await storage.getStore('workflows'))!;
+      const claim = store.claimRunOwnership.bind(store);
+      let restartedAt: number | undefined;
+      vi.spyOn(store, 'claimRunOwnership').mockImplementation(async args => {
+        if (args.runId === restartLeaseKey(run.runId)) {
+          restartedAt ??= Date.now();
+        }
 
-      // Well within one lease TTL, so A's key would still be live had A not released it.
-      if (shutDownFirst) {
+        return claim(args);
+      });
+      const shutDown = async () => {
+        // A's key would stay live until then had A not released it.
+        const liveUntil = (await store.getRunOwnership({ runId: runLivenessKey(run.runId) }))!.leaseExpiresAt!;
         await a.mastra.shutdown({ drainTimeout: 0 });
+        return liveUntil.getTime();
+      };
+
+      let liveUntil: number | undefined;
+      if (shutDownFirst) {
+        liveUntil = await shutDown();
       }
 
       await startReplica(storage, twoSteps(tracked.reporter('B')), { recovery: scanning });
       if (!shutDownFirst) {
         await sleep(scanning.workflowScanIntervalMs * 3);
         expect(await runStatus(storage, run.runId)).toBe('running');
-        await a.mastra.shutdown({ drainTimeout: 0 });
+        liveUntil = await shutDown();
       }
 
-      await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), {
-        timeout: WORKFLOW_RUN_LEASE_TTL_MS / 2,
-        interval: 20,
-      });
+      await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 5_000 });
       expect(tracked.executions).toEqual(['A:first', 'B:second']);
+      expect(restartedAt).toBeLessThan(liveUntil!);
     },
     20_000,
   );

@@ -293,14 +293,7 @@ describe('Mastra.restartAllActiveWorkflowRuns', () => {
     expect(unparseable).toHaveLength(1);
   });
 
-  it('resolves recovery defaults', () => {
-    expect(new Mastra({ logger: false }).recoveryConfig).toEqual({
-      workflows: 'auto',
-      workflowConcurrency: 5,
-      workflowScanIntervalMs: 30_000,
-      workflowStallThresholdMs: 300_000,
-      durableAgents: 'off',
-    });
+  it('falls back to the recovery defaults for invalid values', () => {
     expect(
       new Mastra({
         logger: false,

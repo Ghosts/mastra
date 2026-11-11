@@ -340,9 +340,8 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
       }
       return getStore(domain);
     }) as typeof mastraStorage.getStore);
-    await new Promise(resolve => setTimeout(resolve, 400));
+    await vi.waitFor(() => expect(failures).toBeGreaterThan(0), { timeout: 5_000 });
     failing = false;
-    expect(failures).toBeGreaterThan(0);
 
     await expect.poll(status, { timeout: 5_000 }).toBe('success');
     expect(executions).toEqual([run.runId]);
