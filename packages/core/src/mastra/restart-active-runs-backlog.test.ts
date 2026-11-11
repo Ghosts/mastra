@@ -144,8 +144,14 @@ describe('boot-time recovery of evented runs behind a worker backlog (#28712)', 
     const storage = new InMemoryStore();
     const store = (await storage.getStore('workflows'))!;
     await persistActiveRun(storage, 'orphaned');
-    // Every batched ownership read fails, as a timed-out chunk query would.
-    vi.spyOn(store, 'getRunOwnerships').mockRejectedValue(new Error('read timed out'));
+    // Once the restart lease is held, every batched ownership read fails, as a timed-out chunk query would.
+    const read = store.getRunOwnerships.bind(store);
+    vi.spyOn(store, 'getRunOwnerships').mockImplementation(async args => {
+      if ((await store.getRunOwnership({ runId: restartLeaseKey('orphaned') }))?.live) {
+        throw new Error('read timed out');
+      }
+      return read(args);
+    });
     const b = await startReplica(storage, 'B', [], backloggedPubSub('never'));
     await b.restartAllActiveWorkflowRuns({ mode: 'all' });
 
