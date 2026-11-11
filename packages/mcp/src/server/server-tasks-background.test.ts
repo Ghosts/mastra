@@ -1230,6 +1230,15 @@ describe('MCPServer tasks on Mastra background tasks (libsql)', () => {
       });
     const stepRuns = (step: string) => probe.runs.filter(run => run.tool === step);
 
+    /**
+     * Starts the workers and the boot-time workflow restart, as a deployed server does. The
+     * recovery loop the workers start restarts a crashed run once its lease lapses.
+     */
+    async function bootLikeServer(mastra: Mastra) {
+      await mastra.startWorkers();
+      void mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
+    }
+
     async function onlyRun(mastra: Mastra, key: string) {
       const workflow = mastra.getWorkflow(key);
       const { runs, total } = await workflow.listWorkflowRuns();
@@ -1410,8 +1419,10 @@ describe('MCPServer tasks on Mastra background tasks (libsql)', () => {
       await until(() => stepsIn(stepsFile).includes('crunch'));
       dying.process.kill('SIGKILL');
 
-      const survivor = await workflowInstance(traced());
-      void survivor.mastra.restartAllActiveWorkflowRuns();
+      const survivor = await workflowInstance({
+        mastraExtra: { ...traced().mastraExtra, recovery: { workflowScanIntervalMs: 500 } },
+      });
+      await bootLikeServer(survivor.mastra);
       await waitFor(await requester(survivor.url), taskId, 'completed', 50_000);
       const root = await spanNamed(survivor.mastra, 'tools/call run_nightly');
       const followed = await spanNamed(survivor.mastra, 'task attempt run_nightly #2');
@@ -1428,8 +1439,8 @@ describe('MCPServer tasks on Mastra background tasks (libsql)', () => {
       dying.process.kill('SIGKILL');
 
       // The next instance boots like a deployed server: Mastra recovers the workflow runs it finds.
-      const survivor = await workflowInstance();
-      void survivor.mastra.restartAllActiveWorkflowRuns();
+      const survivor = await workflowInstance({ mastraExtra: { recovery: { workflowScanIntervalMs: 500 } } });
+      await bootLikeServer(survivor.mastra);
       const done = await waitFor(await requester(survivor.url), taskId, 'completed', 50_000);
       expect(done.result).toMatchObject({ isError: false });
       expect(JSON.parse((done.result as any).content[0].text)).toMatchObject({
