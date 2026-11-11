@@ -152,6 +152,23 @@ describe('with an in-process pubsub, a run whose next step event was lost while 
     20_000,
   );
 
+  it('does not hold up shutdown while the store does not answer the release', async () => {
+    const storage = new InMemoryStore();
+    const { a, run } = await loseSecondStep(storage, track({ blocks: [] }));
+    const store = (await storage.getStore('workflows'))!;
+    const release = store.releaseRunOwnership.bind(store);
+    vi.spyOn(store, 'releaseRunOwnership').mockImplementation(fence =>
+      fence.runId === runLivenessKey(run.runId) ? new Promise<boolean>(() => {}) : release(fence),
+    );
+
+    const started = Date.now();
+    await a.mastra.shutdown({ drainTimeout: 0 });
+    expect(Date.now() - started).toBeLessThan(WORKFLOW_RUN_LEASE_TTL_MS * 2);
+    expect(vi.mocked(store.releaseRunOwnership).mock.calls.map(([fence]) => fence.runId)).toContain(
+      runLivenessKey(run.runId),
+    );
+  }, 10_000);
+
   it('is left alone while that process runs, which may be a replica driving its own runs', async () => {
     const storage = new InMemoryStore();
     const tracked = track({ blocks: [] });

@@ -187,19 +187,45 @@ export class ProcessRunLiveness {
    * down. With an in-process pubsub nothing else can deliver those runs' messages, and a released
    * key lets the instance that replaces this one restart them without waiting for the keys to
    * lapse. A key another process wrote since is left alone by the release's fence.
+   *
+   * Waits at most one renew interval, so a slow store cannot hold up the rest of shutdown. A key
+   * not released by then lapses as it would have without the release.
    */
   async release(): Promise<void> {
-    await Promise.allSettled([...this.#writing.values()]);
+    // Never rejects: each release logs its own failure.
+    const releasing = (async () => {
+      await Promise.allSettled([...this.#writing.values()]);
 
-    const claims = [...this.#claims.values()].filter(claim => Date.now() - claim.writtenAt < WORKFLOW_RUN_LEASE_TTL_MS);
-    this.#claims.clear();
-    await forEachBounded(claims, LIVENESS_RENEW_CONCURRENCY, async ({ store, fence }) => {
-      try {
-        await store.releaseRunOwnership(fence);
-      } catch (error) {
-        this.logger?.warn('Failed to release the liveness of a workflow run', { runId: fence.runId, error });
-      }
+      const claims = [...this.#claims.values()].filter(
+        claim => Date.now() - claim.writtenAt < WORKFLOW_RUN_LEASE_TTL_MS,
+      );
+      this.#claims.clear();
+      await forEachBounded(claims, LIVENESS_RENEW_CONCURRENCY, async ({ store, fence }) => {
+        try {
+          await store.releaseRunOwnership(fence);
+        } catch (error) {
+          this.logger?.warn('Failed to release the liveness of a workflow run', { runId: fence.runId, error });
+        }
+      });
+
+      return false;
+    })();
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<boolean>(resolve => {
+      timer = setTimeout(() => resolve(true), LIVENESS_RENEW_INTERVAL_MS);
+      timer.unref?.();
     });
+
+    try {
+      if (await Promise.race([releasing, timedOut])) {
+        this.logger?.warn('Stopped waiting for the liveness of workflow runs to be released during shutdown', {
+          timeoutMs: LIVENESS_RENEW_INTERVAL_MS,
+        });
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
