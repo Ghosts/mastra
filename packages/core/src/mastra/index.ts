@@ -890,8 +890,9 @@ const DURABLE_RECOVERY_RECHECK_JITTER_MS = 5_000;
 const DURABLE_RECOVERY_RECHECK_RETRY_BASE_MS = 30_000;
 const DURABLE_RECOVERY_RECHECK_MAX_RETRIES = 5;
 const DURABLE_RECOVERY_ATTEMPT_TIMEOUT_MS = 30_000;
-// Every tick of every instance lists each restartable workflow's active runs in full, snapshots
-// included; a mid-step crash is restarted within about a lease TTL plus one interval.
+// One default for every store, since every store lists each active status in full on every tick
+// of every instance, snapshots included. A mid-step crash is restarted within about a lease TTL
+// plus one interval.
 const DEFAULT_WORKFLOW_SCAN_INTERVAL_MS = 60_000;
 const DEFAULT_WORKFLOW_STALL_THRESHOLD_MS = 5 * 60_000;
 // Longer timer delays overflow and fire at once.
