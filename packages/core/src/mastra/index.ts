@@ -795,10 +795,11 @@ export interface MastraRecoveryConfig {
    * to storage and without a process keeping it alive before the recovery
    * loop restarts it. Covers a run whose next step message was lost, and an
    * evented run that waits for its next step message, which no lease reports
-   * either way. A run whose process stopped mid-step is restarted sooner. The
-   * loop leaves an evented run in a `sleep()` or `sleepUntil()` step alone
-   * until the sleep is a lease TTL past its stored end time; its first pass
-   * also restarts a run in a sleep stored without an end time. Keep it above
+   * either way. A run whose process stopped mid-step is restarted sooner. An
+   * evented run in a `sleep()` or `sleepUntil()` step isn't stalled: the loop
+   * restarts it once the sleep is a lease TTL past its stored end time, and
+   * its first pass also restarts a run in a sleep stored without an end time,
+   * which then starts over. Keep it above
    * four lease TTLs: a restart that no worker took up yet keeps other
    * instances from restarting the run for that long.
    * @default 300_000
