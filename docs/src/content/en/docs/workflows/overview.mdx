@@ -536,7 +536,7 @@ For tools that agents call, see [make tools safe to repeat](/docs/harness/durabl
 
 ### Recovery loop
 
-An instance that called `mastra.startWorkers()` with the orchestration worker, such as a server or a `mastra worker` process, keeps checking storage for orphaned runs while it runs. An instance with `workers: false`, or with `MASTRA_WORKERS` leaving out `orchestration`, runs no loop, and neither does a script whose workers only started on their own (for example, when it restarts a run or dispatches a background task). The first check runs when the workers start, and the boot-time `mastra.restartAllActiveWorkflowRuns()` call joins it. Later checks run every `recovery.workflowScanIntervalMs`, each up to 20% earlier or later, so instances started together check at different times. The interval defaults to 30 seconds on storage adapters that page workflow runs by creation time (Postgres, LibSQL, MySQL, MongoDB and the in-memory store) and to 2 minutes on the others, which read every run of a workflow on each check.
+An instance that called `mastra.startWorkers()` with the orchestration worker, such as a server or a `mastra worker` process, keeps checking storage for orphaned runs while it runs. An instance with `workers: false`, or with `MASTRA_WORKERS` leaving out `orchestration`, runs no loop, and neither does a script whose workers only started on their own (for example, when it restarts a run or dispatches a background task). The first check runs when the workers start, and the server's boot-time `mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' })` call joins it. Later checks run every `recovery.workflowScanIntervalMs`, each up to 20% earlier or later, so instances started together check at different times. The interval defaults to 30 seconds on storage adapters that page workflow runs by creation time (Postgres, LibSQL, MySQL, MongoDB and the in-memory store) and to 2 minutes on the others, which read every run of a workflow on each check.
 
 A check restarts:
 
@@ -544,7 +544,11 @@ A check restarts:
 - A default-engine run one lease TTL (`MASTRA_AGENT_THREAD_LEASE_TTL_MS`, 15 seconds by default) after its lease expired. The grace keeps a process whose event loop was blocked for a moment from losing its run.
 - A run that no process keeps alive and that wasn't written to storage for `recovery.workflowStallThresholdMs` (5 minutes by default). This recovers an evented run whose next step message was lost. An evented run that waits for its next step message, for example while a busy broker holds it back, isn't restarted before this threshold.
 
-A sleeping run holds no lease. The process that started the sleep wakes it with a timer. The loop leaves evented runs in a `sleep()` or `sleepUntil()` step alone, so if that process stopped, the loop doesn't recover the run. The loop needs a storage adapter with run-ownership support, restarts at most `recovery.workflowConcurrency` runs at a time, honors `autoRestartActiveRuns: false`, and stops on `stopWorkers()` and `shutdown()`. `shutdown()` waits for the restarts already in progress. A default-engine run holds its slot until it finishes, so long runs that fill every slot keep the instance from restarting anything else until one of them finishes. Set `recovery.workflows` to `'off'` to turn off both the boot-time restart and the loop.
+The first check of an instance also restarts an evented run in a `sleep()` or `sleepUntil()` step whose process stopped keeping it alive, and the restart replays the sleep. With the default in-process pubsub, it also restarts an evented run waiting for its next step message, since that message died with the process that published it.
+
+A sleeping run holds no lease. The process that started the sleep wakes it with a timer. Later checks leave evented runs in a `sleep()` or `sleepUntil()` step alone, so if that process stops while the instance keeps running, the loop doesn't recover the run until another instance starts. After an outage of every instance, an evented run waiting for its next step message on a broker that keeps messages is restarted only once `recovery.workflowStallThresholdMs` passed.
+
+The loop needs a storage adapter with run-ownership support. Without it, for example on MongoDB without a replica set, the loop does nothing and only the server's boot-time call restarts runs, every active run once. Runs of a workflow whose `shouldPersistSnapshot` leaves out `running` snapshots, or whose `pruneSnapshot` drops `serializedStepGraph`, are only restarted through the stall rule. The loop restarts at most `recovery.workflowConcurrency` runs at a time, honors `autoRestartActiveRuns: false`, and stops on `stopWorkers()` and `shutdown()`. `shutdown()` waits for the restarts already in progress. A default-engine run holds its slot until it finishes, so long runs that fill every slot keep the instance from restarting anything else until one of them finishes. Set `recovery.workflows` to `'off'` to turn off both the boot-time restart and the loop.
 
 ```typescript title="src/mastra/index.ts"
 import { Mastra } from '@mastra/core/mastra'
@@ -557,7 +561,11 @@ export const mastra = new Mastra({
 })
 ```
 
-`mastra.restartAllActiveWorkflowRuns()` applies the same rules. Pass `{ mode: 'all' }` to restart every active run that no process keeps alive, including sleeping runs and runs that may only be waiting for their next step.
+Called without options, `mastra.restartAllActiveWorkflowRuns()` restarts every active run that no process keeps alive, including sleeping runs and runs that may only be waiting for their next step. Use it when you know no process still drives them. Pass `{ mode: 'orphaned' }` to apply the loop's rules instead, as the server does at boot.
+
+```typescript
+await mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' })
+```
 
 ### Restarting an active workflow run with `restart()`
 
