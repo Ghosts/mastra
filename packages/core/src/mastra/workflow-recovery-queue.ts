@@ -27,6 +27,8 @@ export class WorkflowRecoveryQueue {
   readonly #pending = new Map<string, QueuedRecovery>();
   readonly #running = new Map<string, QueuedRecovery>();
   #closed = false;
+  /** How often the queue was closed; a run whose slot check spans a close is not restarted. */
+  #closings = 0;
 
   /**
    * `restart` restarts one run. A restart, or a `stillOrphaned` check, that throws or rejects is
@@ -101,9 +103,13 @@ export class WorkflowRecoveryQueue {
     return done;
   }
 
-  /** Drops the runs still waiting for a slot and queues nothing more. Restarts already running go on. */
+  /**
+   * Drops the runs still waiting for a slot, and the runs whose slot check is still running, and
+   * queues nothing more. Restarts already running go on.
+   */
   close(): void {
     this.#closed = true;
+    this.#closings++;
     for (const entry of this.#pending.values()) {
       entry.settle();
     }
@@ -140,6 +146,7 @@ export class WorkflowRecoveryQueue {
    */
   async #run(key: string, entry: QueuedRecovery): Promise<void> {
     const run = { workflowName: entry.workflowName, runId: entry.runId };
+    const closings = this.#closings;
 
     try {
       // Deferred one microtask, so a restart never runs inside the enqueue() call that queued it.
@@ -147,6 +154,12 @@ export class WorkflowRecoveryQueue {
 
       // A caller that joined without a check during it overrides a check that found the run alive.
       if (entry.stillOrphaned && !(await entry.stillOrphaned()) && !entry.force) {
+        return;
+      }
+
+      // The workers stopped while the check read storage, even if they started again since: the
+      // restart would start execution workers after their teardown. A later pass finds the run again.
+      if (this.#closings !== closings) {
         return;
       }
 

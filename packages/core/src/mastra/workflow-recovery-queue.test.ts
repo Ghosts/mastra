@@ -18,6 +18,30 @@ describe('WorkflowRecoveryQueue', () => {
     expect(restart).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ['closed', (_queue: WorkflowRecoveryQueue) => {}],
+    ['closed and opened again', (queue: WorkflowRecoveryQueue) => queue.open()],
+  ])('restarts no run whose slot check was still running when the queue was %s', async (_, after) => {
+    const restart = vi.fn(async () => {});
+    const queue = new WorkflowRecoveryQueue(1, restart, () => {});
+    const checking = Promise.withResolvers<boolean>();
+    const checked = vi.fn(() => checking.promise);
+
+    const queued = queue.enqueue('wf', 'run', checked);
+    await vi.waitFor(() => expect(checked).toHaveBeenCalled());
+    // The workers stop while the check reads storage.
+    queue.close();
+    after(queue);
+    checking.resolve(true);
+    await queued;
+
+    expect(restart).not.toHaveBeenCalled();
+    // The slot is free again, so a run queued after reopening is restarted.
+    queue.open();
+    await queue.enqueue('wf', 'run', async () => true);
+    expect(restart).toHaveBeenCalledTimes(1);
+  });
+
   it('leaves a run alone when its slot check finds it no longer orphaned and nothing overrode it', async () => {
     const restart = vi.fn(async () => {});
     const queue = new WorkflowRecoveryQueue(1, restart, () => {});
