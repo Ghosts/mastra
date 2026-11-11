@@ -3925,9 +3925,13 @@ export class WorkflowEventProcessor extends EventProcessor {
           requestContext: withoutAuthToken(requestContext),
           completionGuard: { eventId: args.eventId! },
         });
-      } else if (stepLease !== UNLEASED_STEP && step.type !== 'foreach' && workflowsStore) {
+      } else if (!guardStart && stepLease !== UNLEASED_STEP && step.type !== 'foreach' && workflowsStore) {
         // The record still shows the failed attempt running. Should the hand-off below lapse before
-        // the retry's delivery takes it, the restart that follows continues from that retry.
+        // the retry's delivery takes it, the restart that follows continues from that retry. A
+        // store that guards step starts keeps the saved failed attempt instead, even on a
+        // redelivery that found it saved: the retry's start guard claims the step from it. The
+        // event's copy holds all the start wrote: nested workflow steps, whose start also records
+        // authorization metadata, return before this.
         await workflowsStore.updateWorkflowResults({
           workflowName: workflowId,
           runId,

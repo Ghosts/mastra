@@ -6,7 +6,7 @@ import { PostgresStore } from '../..';
 import { Mastra } from '../../../../../../packages/core/src/mastra';
 import { MASTRA_AUTH_TOKEN_KEY, RequestContext } from '../../../../../../packages/core/src/request-context';
 import { createStep, createWorkflow } from '../../../../../../packages/core/src/workflows/evented';
-import { runLivenessKey } from '../../../../../../packages/core/src/workflows/evented/leases';
+import { runLivenessKey, stepOccurrenceKey } from '../../../../../../packages/core/src/workflows/evented/leases';
 import { abandonLease } from '../../../../../../packages/core/src/workflows/evented/test-utils/abandon-lease';
 import { RedeliveryDriver } from '../../../../../../packages/core/src/workflows/evented/test-utils/redelivery-driver';
 import { connectionString, TEST_CONFIG } from '../../test-utils';
@@ -999,6 +999,9 @@ describe('Postgres evented occurrence replay', () => {
         ).toBe('failed');
         expect(calls).toBe(1);
         interrupted.mockRestore();
+        // The worker died: the step lease it handed to the retry it never published lapses, where
+        // this live process would keep renewing it.
+        await abandonLease(storage, stepOccurrenceKey(run.runId, [0], kind === 'loop' ? 0 : undefined));
         const original = structuredClone(driver.stepRuns({ spec: '0', runId: run.runId })[0]!);
         expect(original.data.stepResults.increment?.metadata?.startedBy).not.toBe(original.id);
         const leaseKey = `workflow-step-run:${run.runId}:${original.id}`;
