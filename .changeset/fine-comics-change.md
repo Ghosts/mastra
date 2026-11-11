@@ -6,7 +6,7 @@ Added a workflow recovery loop (#28712). An instance that runs workers now keeps
 
 `startWorkers()` now starts the loop, and its first pass is the boot-time restart. This reaches every process that calls `startWorkers()`, including standalone `mastra worker` processes and scripts. A process whose workers only start on their own, for example when it restarts a run or dispatches a background task, runs no loop. On storage without run ownership support (no `supportsRunFencing()`, for example MongoDB without a replica set), the loop does nothing, and the server's boot-time call restarts every active run once, as before. Set `recovery.workflows` to `'off'` to turn off both the loop and the boot-time restart.
 
-The loop checks storage every `recovery.workflowScanIntervalMs` (30 seconds by default, 2 minutes on storage that reads every run of a workflow to list its active runs). It restarts:
+The loop checks storage every `recovery.workflowScanIntervalMs` (60 seconds by default). Each check of each instance lists every active run of the workflows recovery restarts, so raise the interval when you run many instances or keep many runs active. It restarts:
 
 - an evented run whose worker stopped in the middle of a step, once that step's lease expires
 - a default-engine run one lease TTL after its lease expired
@@ -17,7 +17,7 @@ The first pass of an instance also restarts sleeping evented runs whose process 
 ```ts
 export const mastra = new Mastra({
   recovery: {
-    workflowScanIntervalMs: 60_000,
+    workflowScanIntervalMs: 2 * 60_000,
     workflowStallThresholdMs: 10 * 60_000,
   },
 });

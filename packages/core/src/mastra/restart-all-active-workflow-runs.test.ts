@@ -307,7 +307,7 @@ describe('Mastra.restartAllActiveWorkflowRuns', () => {
     ).toMatchObject({
       workflows: 'off',
       workflowConcurrency: 1,
-      workflowScanIntervalMs: 30_000,
+      workflowScanIntervalMs: 60_000,
       workflowStallThresholdMs: 300_000,
     });
   });

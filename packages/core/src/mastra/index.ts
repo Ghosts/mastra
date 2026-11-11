@@ -721,7 +721,7 @@ export interface Config<
    * (must be idempotent). In multi-instance deploys a run another replica
    * still drives is skipped, and recovered once that replica's claim lapses.
    *
-   * @default { workflows: 'auto', workflowConcurrency: 5, workflowScanIntervalMs: 30_000, workflowStallThresholdMs: 300_000, durableAgents: 'off' }
+   * @default { workflows: 'auto', workflowConcurrency: 5, workflowScanIntervalMs: 60_000, workflowStallThresholdMs: 300_000, durableAgents: 'off' }
    */
   recovery?: MastraRecoveryConfig;
 
@@ -776,13 +776,16 @@ export interface MastraRecoveryConfig {
    * interval either way, so instances started together don't check at the
    * same time.
    *
-   * Each check lists the active runs of every workflow recovery restarts.
-   * Stores that page workflow runs by `createdAt` read a page at a time; the
-   * others read every run of a workflow per check, so their default is
-   * 120 seconds. On a store without run ownership support (see
+   * Each check of each instance lists, for every workflow recovery restarts,
+   * all its `running` and `waiting` runs with their snapshots, and reads
+   * their leases in batches of a hundred. A run whose worker stopped
+   * mid-step is restarted about one lease TTL plus one interval after the
+   * crash. Raise the interval when instances or active runs are many, or on
+   * a store that can't filter runs by status without reading every run of
+   * the workflow. On a store without run ownership support (see
    * `supportsRunFencing()`) the loop doesn't run. Values are capped at
    * 2^31-1; use `workflows: 'off'` to turn the loop off.
-   * @default 30_000
+   * @default 60_000
    */
   workflowScanIntervalMs?: number;
   /**
@@ -887,10 +890,9 @@ const DURABLE_RECOVERY_RECHECK_JITTER_MS = 5_000;
 const DURABLE_RECOVERY_RECHECK_RETRY_BASE_MS = 30_000;
 const DURABLE_RECOVERY_RECHECK_MAX_RETRIES = 5;
 const DURABLE_RECOVERY_ATTEMPT_TIMEOUT_MS = 30_000;
-const DEFAULT_WORKFLOW_SCAN_INTERVAL_MS = 30_000;
-// Used instead of the default on stores that read every run of a workflow to list its active runs
-// (`listsWorkflowRunsByCreatedAt()` false), where each tick costs a full read.
-const DEFAULT_FULL_LISTING_SCAN_INTERVAL_MS = 120_000;
+// Every tick of every instance lists each restartable workflow's active runs in full, snapshots
+// included; a mid-step crash is restarted within about a lease TTL plus one interval.
+const DEFAULT_WORKFLOW_SCAN_INTERVAL_MS = 60_000;
 const DEFAULT_WORKFLOW_STALL_THRESHOLD_MS = 5 * 60_000;
 // Longer timer delays overflow and fire at once.
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
@@ -1002,8 +1004,6 @@ export class Mastra<
   #workflowRecoveries!: WorkflowRecoveryQueue;
   // The recovery pass in flight per mode; a restartAllActiveWorkflowRuns() call of that mode joins it.
   #workflowPasses = new Map<'orphaned' | 'all', Promise<Promise<void>[] | null>>();
-  // Whether the config set the scan interval, rather than the default that depends on the store.
-  #workflowScanIntervalSet = false;
   // This instance's boot pass: when its first `orphaned` recovery pass started, and whether a pass
   // has since inspected every active run.
   #workflowBootPass?: { startedAt: number; done: boolean };
@@ -1759,7 +1759,6 @@ export class Mastra<
       ),
       durableAgents: config?.recovery?.durableAgents ?? 'off',
     };
-    this.#workflowScanIntervalSet = positiveMs(config?.recovery?.workflowScanIntervalMs, 0) > 0;
     this.#workflowRecoveries = new WorkflowRecoveryQueue(
       this.#recoveryConfig.workflowConcurrency,
       (workflowName, runId) => this.#trackDurableRecovery(this.#restartWorkflowRun(workflowName, runId)),
@@ -4545,7 +4544,7 @@ export class Mastra<
   /**
    * One recovery pass over the active runs of every restartable workflow. Queues a restart of the
    * runs `requested` picks and returns those restarts without waiting for them. Stops before the
-   * next workflow, page or run once `proceed` returns false.
+   * next workflow, batch or run once `proceed` returns false.
    *
    * `all` picks every run no process keeps alive. `orphaned` picks the runs `#isOrphanedRun`
    * finds orphaned, and checks each again when it gets a recovery slot. Without run fencing every
@@ -4913,10 +4912,7 @@ export class Mastra<
       );
     }
     if (!running()) return;
-    const interval =
-      this.#workflowScanIntervalSet || !workflowsStore
-        ? this.#recoveryConfig.workflowScanIntervalMs!
-        : DEFAULT_FULL_LISTING_SCAN_INTERVAL_MS;
+    const interval = this.#recoveryConfig.workflowScanIntervalMs!;
     loop.timer = setTimeout(
       () => void this.#runWorkflowRecoveryTick(loop),
       Math.min(interval * (0.8 + Math.random() * 0.4), MAX_TIMER_DELAY_MS),
@@ -4925,7 +4921,7 @@ export class Mastra<
   }
 
   /**
-   * Stops the recovery loop. A pass in flight stops before its next workflow, page or run;
+   * Stops the recovery loop. A pass in flight stops before its next workflow, batch or run;
    * restarts already running go on.
    */
   #stopWorkflowRecoveryLoop(): void {
@@ -4934,7 +4930,7 @@ export class Mastra<
   }
 
   /**
-   * The runs of one page a recovery pass should consider. A nested run is left out when its
+   * The runs of one batch a recovery pass should consider. A nested run is left out when its
    * parent still drives it, and canceled when its parent already finished, unless the nested run
    * of an `evented` workflow is still live: a worker may be finishing it.
    */

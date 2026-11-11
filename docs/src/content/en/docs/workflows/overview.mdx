@@ -536,7 +536,7 @@ For tools that agents call, see [make tools safe to repeat](/docs/harness/durabl
 
 ### Recovery loop
 
-An instance that called `mastra.startWorkers()` with the orchestration worker, such as a server or a `mastra worker` process, keeps checking storage for orphaned runs while it runs. An instance with `workers: false`, or with `MASTRA_WORKERS` leaving out `orchestration`, runs no loop, and neither does a script whose workers only started on their own (for example, when it restarts a run or dispatches a background task). The first check runs when the workers start, and the server's boot-time `mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' })` call joins it. Later checks run every `recovery.workflowScanIntervalMs`, each up to 20% earlier or later, so instances started together check at different times. The interval defaults to 30 seconds on storage adapters that page workflow runs by creation time (Postgres, LibSQL, MySQL, MongoDB and the in-memory store) and to 2 minutes on the others, which read every run of a workflow on each check.
+An instance that called `mastra.startWorkers()` with the orchestration worker, such as a server or a `mastra worker` process, keeps checking storage for orphaned runs while it runs. An instance with `workers: false`, or with `MASTRA_WORKERS` leaving out `orchestration`, runs no loop, and neither does a script whose workers only started on their own (for example, when it restarts a run or dispatches a background task). The first check runs when the workers start, and the server's boot-time `mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' })` call joins it. Later checks run every `recovery.workflowScanIntervalMs`, each up to 20% earlier or later, so instances started together check at different times. The interval defaults to 60 seconds. Each check of each instance lists every active run of the workflows recovery restarts, snapshots included, so raise the interval when you run many instances or keep many runs active.
 
 A check restarts:
 
@@ -555,7 +555,7 @@ import { Mastra } from '@mastra/core/mastra'
 
 export const mastra = new Mastra({
   recovery: {
-    workflowScanIntervalMs: 60_000,
+    workflowScanIntervalMs: 2 * 60_000,
     workflowStallThresholdMs: 10 * 60_000,
   },
 })

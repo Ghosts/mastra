@@ -394,7 +394,7 @@ Visit the [Configuration reference](/reference/configuration) for detailed docum
       'Recovery behavior for orphaned agent and workflow runs. See [Crash recovery](/docs/harness/durable-agents#crash-recovery) and [restarting active workflow runs](/docs/workflows/overview#restarting-active-workflow-runs).',
     isOptional: true,
     defaultValue:
-      "{ durableAgents: 'off', workflows: 'auto', workflowConcurrency: 5, workflowScanIntervalMs: 30000, workflowStallThresholdMs: 300000 }",
+      "{ durableAgents: 'off', workflows: 'auto', workflowConcurrency: 5, workflowScanIntervalMs: 60000, workflowStallThresholdMs: 300000 }",
     properties: [
       {
         type: 'object',
@@ -427,9 +427,9 @@ Visit the [Configuration reference](/reference/configuration) for detailed docum
             name: 'workflowScanIntervalMs',
             type: 'number',
             isOptional: true,
-            defaultValue: '30000',
+            defaultValue: '60000',
             description:
-              "How often, in milliseconds, the [recovery loop](/docs/workflows/overview#recovery-loop) checks storage for workflow runs whose process stopped. The loop runs on an instance that called `startWorkers()` with the orchestration worker; an instance with `workers: false`, or with `MASTRA_WORKERS` leaving out `orchestration`, runs none. The first check runs when the workers start. Each later check runs up to 20% earlier or later, so instances started together check at different times. Storage adapters that don't page workflow runs by creation time read every run of a workflow on each check, so their default is 120000. On storage adapters without run-ownership support the loop doesn't run. Values are capped at 2147483647; set `workflows` to `'off'` to turn the loop off.",
+              "How often, in milliseconds, the [recovery loop](/docs/workflows/overview#recovery-loop) checks storage for workflow runs whose process stopped. The loop runs on an instance that called `startWorkers()` with the orchestration worker; an instance with `workers: false`, or with `MASTRA_WORKERS` leaving out `orchestration`, runs none. The first check runs when the workers start. Each later check runs up to 20% earlier or later, so instances started together check at different times. Each check lists every active run of the workflows recovery restarts, snapshots included, so raise the interval when you run many instances or keep many runs active. On storage adapters without run-ownership support the loop doesn't run. Values are capped at 2147483647; set `workflows` to `'off'` to turn the loop off.",
           },
           {
             name: 'workflowStallThresholdMs',
