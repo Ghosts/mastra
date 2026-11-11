@@ -540,6 +540,55 @@ describe('waking an evented sleep once (#30012)', () => {
     expect(seen.executions).toEqual(['A:before', 'A:after']);
   }, 20_000);
 
+  it('sets a sleep up from a redelivery that arrived while the delivery that died setting it up still held its start lease', async () => {
+    const storage = new InMemoryStore();
+    const store = (await storage.getStore('workflows'))!;
+    const seen = observe('leased');
+    const settingUp = Promise.withResolvers<void>();
+    // A dies while its duration function runs; B's resolves at once.
+    const build = (report: Report, replica: string) =>
+      createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num })
+        .then(work('before', report))
+        .sleep(async () => {
+          if (replica === 'A') {
+            settingUp.resolve();
+            await new Promise<never>(() => {});
+          }
+
+          return 50;
+        })
+        .then(work('after', report))
+        .commit() as unknown as Built;
+    let sleepEvent: Event | undefined;
+    const pubsubA = interceptWorkflowEvents(new EventEmitterPubSub(), event => {
+      if (isStepRunAt(event, [1])) {
+        sleepEvent ??= structuredClone(event);
+      }
+
+      return undefined;
+    });
+    const a = await startReplica(storage, build(seen.reporter('A'), 'A'), { pubsub: pubsubA });
+    const b = await startReplica(storage, build(seen.reporter('B'), 'B'), { recovery: { workflows: 'off' } });
+    const run = await a.workflow.createRun();
+    startInBackground(run, { n: 1 });
+    await settingUp.promise;
+
+    // A dies: its start lease stays live for one more TTL, and nothing renews it after that.
+    await a.mastra.shutdown({ drainTimeout: 0 });
+    await store.claimRunOwnership({
+      runId: sleepStartKey(run.runId, [1]),
+      ownerId: 'crashed-process',
+      leaseMs: WORKFLOW_RUN_LEASE_TTL_MS,
+      force: true,
+    });
+
+    // The broker redelivers the sleep's event to B while that lease is live.
+    expect(await b.mastra.handleWorkflowEvent({ ...sleepEvent!, deliveryAttempt: 2 })).toEqual({ ok: true });
+
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 5_000 });
+    expect(seen.executions).toEqual(['A:before', 'B:after']);
+  }, 20_000);
+
   it('leaves a run canceled while its sleep duration resolved canceled', async () => {
     const storage = new InMemoryStore();
     const seen = observe('leased');

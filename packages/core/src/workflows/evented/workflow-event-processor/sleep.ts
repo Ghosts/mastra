@@ -14,6 +14,7 @@ import {
 } from '../leases';
 import type { LivenessScope, SleepWakeLease } from '../leases';
 import type { StepExecutor } from '../step-executor';
+import { DeferredDelivery } from './deferred-delivery';
 import { getStepId } from './utils';
 import type { ProcessorArgs } from '.';
 
@@ -230,8 +231,8 @@ export async function processWorkflowSleepUntil(
  * finds the occurrence it read already woken only marks it finished.
  *
  * With step leases, deliveries of the sleep's event set it up one at a time
- * (see `claimSleepStart`): one that finds another delivery doing so is
- * dropped, and the stored run is read only once the lease is held.
+ * (see `claimSleepStart`): one that finds another delivery doing so waits for
+ * it, and the stored run is read only once the lease is held.
  */
 async function startSleep(
   args: ProcessorArgs,
@@ -240,17 +241,21 @@ async function startSleep(
 ) {
   const { workflowId, runId, executionPath } = args;
   const start = deps.leaseStore
-    ? await claimSleepStart({ store: deps.leaseStore, key: sleepStartKey(runId, executionPath), logger: deps.logger })
+    ? await claimSleepStart({
+        scope: deps.scope,
+        store: deps.leaseStore,
+        key: sleepStartKey(runId, executionPath),
+        logger: deps.logger,
+      })
     : undefined;
-  // The delivery holding the lease sets the occurrence up, and its broker redelivers its event if
-  // its process stops first.
-  if (start === null) {
-    deps.logger?.debug('Dropping a delivery of a sleep another delivery is starting', {
-      workflowId,
-      runId,
-      executionPath,
-    });
+  // Another delivery held the lease and set the occurrence up.
+  if (start === 'drop') {
+    deps.logger?.debug('Dropping a delivery of a sleep another delivery set up', { workflowId, runId, executionPath });
     return;
+  }
+
+  if (start === 'defer') {
+    throw new DeferredDelivery();
   }
 
   try {

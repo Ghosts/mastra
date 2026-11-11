@@ -12,8 +12,10 @@ import {
   repeatAfterSettled,
 } from '../../run-ownership';
 import type { WorkflowRunState } from '../../types';
+import type { LivenessScope } from './liveness';
 import { allNestedRuns, stepResultsOf } from './recovery-state';
 import type { StoredNestedRun } from './recovery-state';
+import { holdDelay, sleep as wait } from './step-lease';
 
 /** A sleep lease this process holds, renewed until it is released or abandoned. */
 export interface SleepWakeLease {
@@ -104,27 +106,55 @@ function holdSleepLease(
 
 /**
  * Claims the lease that serializes starting and resuming one sleep (see
- * `sleepStartKey`), without waiting: `null` while another delivery of the
- * sleep's event holds it. That delivery sets the occurrence up, and the broker
- * redelivers its event if its process stops first.
+ * `sleepStartKey`). While another delivery of the sleep's event holds it, this
+ * one waits as a step delivery waits for a live step lease (see
+ * `acquireStepLease`): `'drop'` once the holder released it, since the holder
+ * then set the occurrence up, and the lease once it expired unreleased, since
+ * the holder's process stopped mid-setup and a broker that has already
+ * redelivered the event may not deliver it again. `'defer'` when `scope` is
+ * shutting down, so the broker hands the delivery to another instance.
  */
 export async function claimSleepStart({
+  scope,
   store,
   key,
   logger,
 }: {
+  scope: LivenessScope;
   store: WorkflowsStorage;
   key: string;
   logger?: IMastraLogger;
-}): Promise<SleepWakeLease | null> {
-  const claim = await store.claimRunOwnership({
-    runId: key,
-    ownerId: globalThis.crypto.randomUUID(),
-    leaseMs: WORKFLOW_RUN_LEASE_TTL_MS,
-    force: false,
-  });
+}): Promise<SleepWakeLease | 'drop' | 'defer'> {
+  const ownerId = globalThis.crypto.randomUUID();
+  let result = await store.claimRunOwnership({ runId: key, ownerId, leaseMs: WORKFLOW_RUN_LEASE_TTL_MS, force: false });
 
-  return claim.acquired ? holdSleepLease(store, claim.record, logger) : null;
+  while (!result.acquired) {
+    // Checked before and after the wait: a process shutting down hands the delivery back at once.
+    if (scope.__shuttingDown) {
+      return 'defer';
+    }
+
+    await wait(holdDelay(result.record));
+    if (scope.__shuttingDown) {
+      return 'defer';
+    }
+
+    const current = await store.getRunOwnership({ runId: key });
+    if (current && !current.leaseExpiresAt) {
+      return 'drop';
+    }
+
+    // Racing waiters that read the same record resolve to one winner.
+    result = await store.claimRunOwnership({
+      runId: key,
+      ownerId,
+      leaseMs: WORKFLOW_RUN_LEASE_TTL_MS,
+      force: false,
+      expectedGeneration: current?.generation ?? 0,
+    });
+  }
+
+  return holdSleepLease(store, result.record, logger);
 }
 
 /**
