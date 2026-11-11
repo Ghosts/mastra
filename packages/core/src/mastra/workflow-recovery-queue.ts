@@ -69,12 +69,23 @@ export class WorkflowRecoveryQueue {
     const key = JSON.stringify([workflowName, runId]);
     const pending = this.#pending.get(key);
     if (pending) {
-      if (!stillOrphaned) pending.stillOrphaned = undefined;
+      // The caller without a check (an `all` pass) wants the run restarted whatever it finds.
+      if (!stillOrphaned) {
+        pending.stillOrphaned = undefined;
+      }
+
       return pending.done;
     }
+
     const running = this.#running.get(key);
-    if (running) return running.done;
-    if (this.#closed) return Promise.resolve();
+    if (running) {
+      return running.done;
+    }
+
+    if (this.#closed) {
+      return Promise.resolve();
+    }
+
     let settle!: () => void;
     const done = new Promise<void>(resolve => (settle = resolve));
     this.#pending.set(key, { workflowName, runId, stillOrphaned, done, settle });
@@ -85,7 +96,10 @@ export class WorkflowRecoveryQueue {
   /** Drops the runs still waiting for a slot and queues nothing more. Restarts already running go on. */
   close(): void {
     this.#closed = true;
-    for (const entry of this.#pending.values()) entry.settle();
+    for (const entry of this.#pending.values()) {
+      entry.settle();
+    }
+
     this.#pending.clear();
   }
 
@@ -101,28 +115,43 @@ export class WorkflowRecoveryQueue {
   #startNext(): void {
     while (this.#running.size < this.#limit) {
       const next = this.#pending.entries().next();
-      if (next.done) return;
+      if (next.done) {
+        return;
+      }
+
       const [key, entry] = next.value;
       this.#pending.delete(key);
       this.#running.set(key, entry);
-      const run = { workflowName: entry.workflowName, runId: entry.runId };
-      void Promise.resolve()
-        .then(async () => {
-          if (entry.stillOrphaned && !(await entry.stillOrphaned())) return;
-          await this.#restart(run.workflowName, run.runId);
-        })
-        .catch(error => {
-          try {
-            this.#onError(error, run);
-          } catch {
-            // A failing error report must not keep the slot or stop the queue.
-          }
-        })
-        .finally(() => {
-          this.#running.delete(key);
-          entry.settle();
-          this.#startNext();
-        });
+      void this.#run(key, entry);
+    }
+  }
+
+  /**
+   * Restarts one queued run unless its slot check finds it no longer orphaned. Never rejects:
+   * failures go to `onError`, and the slot is freed however the restart settles.
+   */
+  async #run(key: string, entry: QueuedRecovery): Promise<void> {
+    const run = { workflowName: entry.workflowName, runId: entry.runId };
+
+    try {
+      // Deferred one microtask, so a restart never runs inside the enqueue() call that queued it.
+      await Promise.resolve();
+
+      if (entry.stillOrphaned && !(await entry.stillOrphaned())) {
+        return;
+      }
+
+      await this.#restart(run.workflowName, run.runId);
+    } catch (error) {
+      try {
+        this.#onError(error, run);
+      } catch {
+        // A failing error report must not keep the slot or stop the queue.
+      }
+    } finally {
+      this.#running.delete(key);
+      entry.settle();
+      this.#startNext();
     }
   }
 }

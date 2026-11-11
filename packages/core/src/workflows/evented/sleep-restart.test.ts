@@ -232,7 +232,9 @@ describe('evented workflow durable sleep recovery', () => {
       vi.spyOn(workflow, 'createRun').mockImplementation(async options => {
         if (options?.runId) {
           restarted.push(options.runId);
-          if (restarted.length === 1) await gate.promise;
+          if (restarted.length === 1) {
+            await gate.promise;
+          }
         }
         return createRun(options);
       });

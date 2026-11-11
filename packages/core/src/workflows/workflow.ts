@@ -5487,7 +5487,10 @@ export class Run<
   /** Runs `execute` under the run's lease: `held`, when the caller hands one over, or a new claim. */
   async #executeOwned<T>(execute: () => Promise<T>, held?: WorkflowRunOwnership): Promise<T> {
     const ownership = held ?? (await this.#claimOwnership(true));
-    if (!('release' in ownership)) return execute();
+    if (!('release' in ownership)) {
+      return execute();
+    }
+
     try {
       return await execute();
     } finally {
@@ -5889,32 +5892,61 @@ export class Run<
           const claim = await parentRun.#claimOwnership(true);
           parentLease = 'release' in claim ? claim : undefined;
         } catch (error) {
-          await parentRun.runStorage
-            .updateHeader({ status: 'suspended', expectedStatus: 'running' })
-            .catch(() => undefined);
+          try {
+            await parentRun.runStorage.updateHeader({ status: 'suspended', expectedStatus: 'running' });
+          } catch (suspendError) {
+            // The claim error is the one thrown; a parent left `running` is recovered like a stalled run.
+            this.#mastra
+              ?.getLogger()
+              ?.warn(
+                `[Workflow ${this.workflowId}] Failed to suspend parent run ${parentRun.runId} again after its lease claim failed`,
+                suspendError,
+              );
+          }
+
           await releaseClaimIfUnused();
           throw error;
         }
       }
+
       let leaseHandedOver = false;
       claimedParent = {
         run: parentRun,
         snapshot: parentSnapshot,
         takeLease: () => {
-          if (leaseHandedOver) return undefined;
+          if (leaseHandedOver) {
+            return undefined;
+          }
+
           leaseHandedOver = true;
           return parentLease;
         },
         releaseLease: async () => {
-          if (leaseHandedOver || !parentLease) return;
+          if (leaseHandedOver || !parentLease) {
+            return;
+          }
+
           leaseHandedOver = true;
-          await parentLease.release().catch(() => {});
+          try {
+            await parentLease.release();
+          } catch (releaseError) {
+            // The lease lapses on its own one TTL later.
+            this.#mastra
+              ?.getLogger()
+              ?.warn(
+                `[Workflow ${this.workflowId}] Failed to release the lease of parent run ${parentRun.runId}`,
+                releaseError,
+              );
+          }
         },
       };
     }
 
     const releaseParentClaim = async () => {
-      if (!claimedParent) return;
+      if (!claimedParent) {
+        return;
+      }
+
       // Suspended first: a released lease on a `running` parent would read as a crashed resume.
       try {
         await claimedParent.run.runStorage.updateHeader({ status: 'suspended', expectedStatus: 'running' });
@@ -5926,6 +5958,7 @@ export class Run<
             releaseError,
           );
       }
+
       await claimedParent.releaseLease();
     };
 

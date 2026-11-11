@@ -318,7 +318,10 @@ export function createWorkflowsTests({ storage, workflowResultsNoopWhenRunMissin
           }
         } catch (error) {
           // Only adapters that don't implement the method at all are exempt.
-          if (/not (yet )?(implemented|supported)/i.test(String((error as Error)?.message ?? error))) return skip();
+          if (/not (yet )?(implemented|supported)/i.test(String((error as Error)?.message ?? error))) {
+            return skip();
+          }
+
           throw error;
         }
 

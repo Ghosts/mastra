@@ -19,9 +19,7 @@ const NESTED_RUN_READ_CONCURRENCY = 8;
  * The nested runs a running step result still drives: its own nested run, or
  * the nested runs of the foreach items that have not finished.
  */
-function runningNestedRunIds(
-  result: { status?: unknown; metadata?: unknown; output?: unknown } | undefined,
-): string[] {
+function runningNestedRunIds(result: { status?: unknown; metadata?: unknown; output?: unknown } | undefined): string[] {
   if (result?.status !== 'running') {
     return [];
   }
@@ -185,7 +183,8 @@ export async function loadNestedRuns({
         return;
       }
 
-      const nestedSnapshot: WorkflowRunState = typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot;
+      const nestedSnapshot: WorkflowRunState =
+        typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot;
       loaded.push({
         runId,
         snapshot: nestedSnapshot,

@@ -154,7 +154,10 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
     const renew = workflowsStore.renewRunOwnership.bind(workflowsStore);
     let paused = true;
     vi.spyOn(workflowsStore, 'renewRunOwnership').mockImplementation(async args => {
-      if (paused && args.runId === run.runId) throw new Error('renewal did not run');
+      if (paused && args.runId === run.runId) {
+        throw new Error('renewal did not run');
+      }
+
       return renew(args);
     });
     const listings = vi.spyOn(workflowsStore, 'listWorkflowRuns');
@@ -190,7 +193,10 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
               resumeSchema: z.object({ approved: z.boolean() }),
               execute: async ({ resumeData, suspend }) => {
                 executions.push(`${replica}:approve:${resumeData ? 'resumed' : 'suspended'}`);
-                if (!resumeData) return suspend({});
+                if (!resumeData) {
+                  return suspend({});
+                }
+
                 resumed.resolve();
                 await finish.promise;
                 return {};
@@ -262,7 +268,10 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
           resumeSchema: z.object({ approved: z.boolean() }),
           execute: async ({ resumeData, suspend }) => {
             executions.push(`approve:${resumeData ? 'resumed' : 'suspended'}`);
-            if (!resumeData) return suspend({});
+            if (!resumeData) {
+              return suspend({});
+            }
+
             return {};
           },
         }),
@@ -316,7 +325,10 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
     const { run, workflowsStore, resume } = await suspendedInChild(storage, executions);
     const claim = workflowsStore.claimRunOwnership.bind(workflowsStore);
     vi.spyOn(workflowsStore, 'claimRunOwnership').mockImplementation(async args => {
-      if (args.runId === run.runId) throw new Error('store unavailable');
+      if (args.runId === run.runId) {
+        throw new Error('store unavailable');
+      }
+
       return claim(args);
     });
 
@@ -477,7 +489,10 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
         const replica = buildReplica(storage, async () => {}, recovery);
         replicas.push(replica);
         const orphaned = await persistOrphanedRun(storage, replica, 300);
-        if (unfenced) vi.spyOn(orphaned.workflowsStore, 'supportsRunFencing').mockReturnValue(false);
+        if (unfenced) {
+          vi.spyOn(orphaned.workflowsStore, 'supportsRunFencing').mockReturnValue(false);
+        }
+
         const listings = vi.spyOn(orphaned.workflowsStore, 'listWorkflowRuns');
         await replica.startWorkers();
         return { ...orphaned, replica, listings };
@@ -489,7 +504,10 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
       await expect.poll(auto.status, { timeout: 5_000 }).toBe('success');
       expect(off.listings).not.toHaveBeenCalled();
       expect(await off.status()).toBe('running');
-      if (!unfenced) return;
+      if (!unfenced) {
+        return;
+      }
+
       // The server's boot-time call still sweeps a store without run ownership support once.
       await off.replica.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
       await expect.poll(off.status, { timeout: 5_000 }).toBe('success');
