@@ -592,7 +592,7 @@ if (activeRuns.runs.length > 0) {
 
 :::note
 
-When running the local mastra server, all active workflow runs will be restarted automatically when the server starts.
+When the Mastra server starts, it restarts orphaned workflow runs with `mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' })`, which applies the [recovery loop](#recovery-loop) rules. On storage adapters without run-ownership support, it restarts every active run.
 
 :::
 
