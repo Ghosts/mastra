@@ -5501,6 +5501,10 @@ export class Run<
    * status it was loaded in. Throws `WORKFLOW_RESUME_ALREADY_CLAIMED` or
    * `WORKFLOW_TIME_TRAVEL_ALREADY_CLAIMED` when another caller already claimed the run, so losing
    * callers never enter the execution engine.
+   *
+   * Resolves to whether this caller flipped the status. It is false when nothing was claimed: no
+   * store, a workflow that doesn't persist `running` snapshots, or a store without the
+   * compare-and-set.
    */
   async #claimRun({
     workflowsStore,
@@ -5510,9 +5514,9 @@ export class Run<
     workflowsStore: WorkflowsStorage | undefined;
     snapshot: WorkflowRunState;
     operation?: 'resume' | 'timeTravel';
-  }): Promise<void> {
+  }): Promise<boolean> {
     if (!workflowsStore) {
-      return;
+      return false;
     }
 
     // The claim is a persisted state transition, so a workflow that opts out of persisting
@@ -5540,7 +5544,7 @@ export class Run<
             `[Workflow ${this.workflowId}] shouldPersistSnapshot excludes the "running" status, so concurrent ${operation}() calls for run ${this.runId} cannot be de-duplicated. Concurrent calls may execute downstream steps more than once.`,
           );
       }
-      return;
+      return false;
     }
 
     // Stores that report no concurrent-update support cannot honor the compare-and-set: some of
@@ -5555,14 +5559,14 @@ export class Run<
             `[Workflow ${this.workflowId}] The configured workflow storage does not support concurrent updates, so concurrent ${operation}() calls for run ${this.runId} cannot be de-duplicated atomically. Concurrent calls may execute downstream steps more than once.`,
           );
       }
-      return;
+      return false;
     }
 
     await this.beforeRunClaim();
     const claimed = await this.runStorage.updateHeader({ status: 'running', expectedStatus });
 
     if (claimed) {
-      return;
+      return true;
     }
 
     // The compare-and-set found a status other than the expected one. Re-read so the error names the
@@ -5861,18 +5865,25 @@ export class Run<
       }
 
       const parentRun = await parentWorkflow.createRun({ runId: this.parentWorkflow.runId });
+      let flippedParent: boolean;
       try {
-        await parentRun.#claimRun({ workflowsStore, snapshot: parentSnapshot });
+        flippedParent = await parentRun.#claimRun({ workflowsStore, snapshot: parentSnapshot });
       } catch (error) {
         await releaseClaimIfUnused();
         throw error;
       }
       // The parent is `running` while this run executes, so it holds its run lease meanwhile: the
       // recovery loop must not restart it, and with it this run's step, while this run still works.
-      const parentLease = await parentRun.#claimOwnership(true).catch(error => {
-        this.#mastra?.getLogger()?.warn(`[Workflow ${this.workflowId}] Failed to claim the parent run's lease`, error);
-        return undefined;
-      });
+      // Only the caller that flipped the parent takes it: without the compare-and-set, concurrently
+      // resumed siblings would take it from one another.
+      const parentLease = flippedParent
+        ? await parentRun.#claimOwnership(true).catch(error => {
+            this.#mastra
+              ?.getLogger()
+              ?.warn(`[Workflow ${this.workflowId}] Failed to claim the parent run's lease`, error);
+            return undefined;
+          })
+        : undefined;
       claimedParent = {
         run: parentRun,
         snapshot: parentSnapshot,
@@ -5884,7 +5895,7 @@ export class Run<
 
     const releaseParentClaim = async () => {
       if (!claimedParent) return;
-      await claimedParent.releaseLease();
+      // Suspended first: a released lease on a `running` parent would read as a crashed resume.
       try {
         await claimedParent.run.runStorage.updateHeader({ status: 'suspended', expectedStatus: 'running' });
       } catch (releaseError) {
@@ -5895,6 +5906,7 @@ export class Run<
             releaseError,
           );
       }
+      await claimedParent.releaseLease();
     };
 
     params.onExecutionStarted?.();
