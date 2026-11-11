@@ -540,6 +540,40 @@ describe('waking an evented sleep once (#30012)', () => {
     expect(seen.executions).toEqual(['A:before', 'A:after']);
   }, 20_000);
 
+  it('leaves a run canceled while its sleep duration resolved canceled', async () => {
+    const storage = new InMemoryStore();
+    const seen = observe('leased');
+    const resolving = Promise.withResolvers<void>();
+    const resolve = Promise.withResolvers<void>();
+    const build = (report: Report) =>
+      createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num })
+        .then(work('before', report))
+        .sleep(async () => {
+          resolving.resolve();
+          await resolve.promise;
+          return 50;
+        })
+        .then(work('after', report))
+        .commit() as unknown as Built;
+    const a = await startReplica(storage, build(seen.reporter('A')), {
+      pubsub: seen.pubsub('A'),
+      recovery: { workflows: 'off' },
+    });
+    const run = await a.workflow.createRun();
+    startInBackground(run, { n: 1 });
+    await resolving.promise;
+
+    await run.cancel();
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('canceled'));
+    resolve.resolve();
+    // Past the sleep's wake time.
+    await sleep(300);
+
+    expect(await runStatus(storage, run.runId)).toBe('canceled');
+    expect(seen.continuations).toEqual([]);
+    expect(seen.executions).toEqual(['A:before']);
+  }, 20_000);
+
   it('sets up a sleep in a run whose state JSON cannot hold', async () => {
     const storage = new InMemoryStore();
     const seen = observe('leased');

@@ -377,6 +377,22 @@ async function setUpSleep(
       });
       return;
     }
+
+    // A cancel that finished while the duration function ran must not be undone by setting the
+    // run `running` again. Only a change counts: a time-travelled run whose `running` snapshots
+    // are left out still shows the status of the run it travels from.
+    const current = snapshot
+      ? await workflowsStore?.loadWorkflowSnapshot({ workflowName: workflowId, runId })
+      : undefined;
+    if (current && FINISHED_RUN_STATUSES.has(current.status) && current.status !== snapshot?.status) {
+      deps.logger?.debug('Dropping a sleep setup of a run that ended while its duration resolved', {
+        workflowId,
+        runId,
+        executionPath,
+        status: current.status,
+      });
+      return;
+    }
   }
 
   await workflowsStore?.updateWorkflowResults({
@@ -394,6 +410,9 @@ async function setUpSleep(
       status: 'running',
       activePaths: executionPath,
       activeStepsPath: { ...activeStepsPath, [stepId]: executionPath },
+      // A cancel landing after the check above still wins on stores that compare and set. A wake
+      // then finds the run canceled and stays put.
+      ...(snapshot ? { expectedStatus: snapshot.status } : {}),
     },
   });
 
