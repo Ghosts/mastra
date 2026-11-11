@@ -21,7 +21,7 @@ export const mastra = new Mastra({
 });
 ```
 
-The first pass of an instance also restarts sleeping evented runs whose process stopped, as the boot-time restart did before; later passes leave sleeping runs alone. With the default in-process pubsub, the first pass also restarts evented runs waiting for their next step message, since those messages died with their process. An instance on that pubsub marks its evented runs as no longer driven when `shutdown()` runs, so the next pass of any instance restarts them at once instead of waiting for their lease to expire.
+The first pass of an instance also restarts a run in a sleep stored without an end time (one started before this release). With the default in-process pubsub, the first pass also restarts evented runs waiting for their next step message, since those messages died with their process. An instance on that pubsub marks its evented runs as no longer driven when `shutdown()` runs, so the next pass of any instance restarts them at once instead of waiting for their lease to expire.
 
 After an outage of every instance, an evented run waiting for its next step message on a broker that keeps messages is restarted once `recovery.workflowStallThresholdMs` passed, not at boot.
 
