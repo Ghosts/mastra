@@ -84,7 +84,14 @@ async function startSleepingRun({
   runId: string;
 }) {
   const pubsub = new EventEmitterPubSub();
-  const runtime = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
+  // The process that stops; its own recovery must not take up runs an earlier one left.
+  const runtime = new Mastra({
+    logger: false,
+    storage,
+    pubsub,
+    recovery: { workflows: 'off' },
+    workflows: { [workflow.id]: workflow },
+  });
   await runtime.startWorkers();
 
   const run = await workflow.createRun({ runId });
@@ -195,6 +202,78 @@ describe('evented workflow durable sleep recovery', () => {
       await replacementRuntime.stopWorkers();
     },
   );
+
+  describe('a sleeping run that waits for a recovery slot during the boot pass', () => {
+    /**
+     * Two sleeping runs whose process stopped, and a replacement with one recovery slot whose boot
+     * pass restarts one run while the other waits. `whileQueued` runs while the other waits.
+     */
+    async function bootWithOneSlot(whileQueued: (queued: { runId: string; store: any }) => Promise<void>) {
+      const storage = new MockStore();
+      const workflow = createSleepingWorkflow({
+        id: 'sleep-slot-workflow',
+        duration: 5_000,
+        beforeSleep: async () => ({ value: 'persist me' }),
+        afterSleep: async ({ inputData }) => inputData,
+      });
+      const store = (await startSleepingRun({ storage, workflow, runId: 'sleep-slot-run-1' }))!;
+      await startSleepingRun({ storage, workflow, runId: 'sleep-slot-run-2' });
+      const replacementRuntime = new Mastra({
+        logger: false,
+        storage,
+        pubsub: new BrokerLikePubSub(),
+        recovery: { workflowConcurrency: 1 },
+        workflows: { [workflow.id]: workflow },
+      });
+      // The first restart holds the only slot until the other run was dealt with.
+      const createRun = workflow.createRun.bind(workflow);
+      const gate = Promise.withResolvers<void>();
+      const restarted: string[] = [];
+      vi.spyOn(workflow, 'createRun').mockImplementation(async options => {
+        if (options?.runId) {
+          restarted.push(options.runId);
+          if (restarted.length === 1) await gate.promise;
+        }
+        return createRun(options);
+      });
+      await replacementRuntime.startWorkers();
+      const pass = replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
+      await vi.waitFor(() => expect(restarted).toHaveLength(1));
+      const queued = restarted[0] === 'sleep-slot-run-1' ? 'sleep-slot-run-2' : 'sleep-slot-run-1';
+      await whileQueued({ runId: queued, store });
+      gate.resolve();
+      await pass;
+      return { replacementRuntime, restarted, queued };
+    }
+
+    it('is left alone at its slot when another process took it up meanwhile', async () => {
+      const { replacementRuntime, restarted, queued } = await bootWithOneSlot(async ({ runId, store }) => {
+        // Another process takes the run up and puts it into a new sleep, then stops vouching for it.
+        await store.updateWorkflowState({ workflowName: 'sleep-slot-workflow', runId, opts: { status: 'running' } });
+      });
+      expect(restarted).not.toContain(queued);
+      await replacementRuntime.stopWorkers();
+    });
+
+    it('is restarted by a later pass when its check at the slot failed to read its leases', async () => {
+      const { replacementRuntime, restarted, queued } = await bootWithOneSlot(async ({ runId, store }) => {
+        const read = store.getRunOwnerships.bind(store);
+        let failed = false;
+        vi.spyOn(store, 'getRunOwnerships').mockImplementation(async (args: { runIds: string[] }) => {
+          if (!failed && args.runIds.includes(runLivenessKey(runId))) {
+            failed = true;
+            throw new Error('store unavailable');
+          }
+          return read(args);
+        });
+      });
+      expect(restarted).not.toContain(queued);
+
+      await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
+      expect(restarted).toContain(queued);
+      await replacementRuntime.stopWorkers();
+    });
+  });
 
   it.each(pubsubs)('replays a sleepUntil path after restart, with %s', async (_, pubsub) => {
     const storage = new MockStore();

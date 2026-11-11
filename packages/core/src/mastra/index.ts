@@ -4617,11 +4617,16 @@ export class Mastra<
           }
           for (const run of picked) {
             if (!proceed()) return restarts;
+            // At its slot a run gets boot treatment only if it wasn't written since it was listed:
+            // another process may have taken it up and put it into a new sleep meanwhile.
+            const listedAt = new Date(run.updatedAt).getTime();
+            const bootAtSlot: BootRule | undefined =
+              boot && (current => boot(current) && new Date(current.updatedAt).getTime() === listedAt);
             restarts.push(
               mode === 'all'
                 ? queue.enqueue(run.workflowName, run.runId)
                 : queue.enqueue(run.workflowName, run.runId, () =>
-                    this.#stillOrphaned(run.workflowName, run.runId, evented, workflowsStore, boot),
+                    this.#stillOrphaned(run.workflowName, run.runId, evented, workflowsStore, bootAtSlot),
                   ),
             );
           }
@@ -4737,7 +4742,8 @@ export class Mastra<
 
   /**
    * Whether a run queued by an `orphaned` pass is still orphaned when it gets its recovery slot.
-   * Reads the run and its leases again.
+   * Reads the run and its leases again. A check of a boot pass run that fails to read them hands
+   * boot treatment to the next pass again, as a failed read during the boot pass itself does.
    */
   async #stillOrphaned(
     workflowName: string,
@@ -4746,12 +4752,20 @@ export class Mastra<
     workflowsStore: WorkflowsStorage,
     boot: BootRule | undefined,
   ): Promise<boolean> {
-    const run = await workflowsStore.getWorkflowRunById({ runId, workflowName });
-    if (!run) return false;
-    const snapshot = this.#parsedSnapshot(run);
-    // An unparseable run is judged as when it was listed.
-    if (snapshot && snapshot.status !== 'running' && snapshot.status !== 'waiting') return false;
-    return (await this.#orphanedRuns([run], evented, workflowsStore, boot)).length > 0;
+    const inspection = { failed: false };
+    try {
+      const run = await workflowsStore.getWorkflowRunById({ runId, workflowName });
+      if (!run) return false;
+      const snapshot = this.#parsedSnapshot(run);
+      // An unparseable run is judged as when it was listed.
+      if (snapshot && snapshot.status !== 'running' && snapshot.status !== 'waiting') return false;
+      return (await this.#orphanedRuns([run], evented, workflowsStore, boot, inspection)).length > 0;
+    } catch (error) {
+      inspection.failed = true;
+      throw error;
+    } finally {
+      if (boot && inspection.failed && this.#workflowBootPass) this.#workflowBootPass.done = false;
+    }
   }
 
   /**
