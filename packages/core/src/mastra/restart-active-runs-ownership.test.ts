@@ -402,6 +402,38 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
     expect((setTimeoutSpy.mock.results[tick]!.value as NodeJS.Timeout).hasRef()).toBe(false);
   });
 
+  it("sweeps every active run once on an 'orphaned' call whose run fencing probe failed", async () => {
+    const storage = new InMemoryStore();
+    const replica = buildReplica(storage, async () => {});
+    replicas.push(replica);
+    const orphaned = await persistOrphanedRun(storage, replica, 50);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    // Only the first probe fails; the sweep it falls back to probes again.
+    vi.spyOn(orphaned.workflowsStore, 'supportsRunFencing').mockRejectedValueOnce(new Error('probe failed'));
+
+    // The lease lapsed less than a TTL ago, which an `orphaned` pass that could probe would wait out.
+    await replica.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
+    expect(await orphaned.status()).toBe('success');
+  });
+
+  it('waits for the next tick when the scan interval exceeds the longest timer delay', async () => {
+    const storage = new InMemoryStore();
+    const replica = buildReplica(storage, async () => {}, { workflowScanIntervalMs: 2 ** 31 });
+    replicas.push(replica);
+    const listings = vi.spyOn((await storage.getStore('workflows'))!, 'listWorkflowRuns');
+    // The latest jitter, a fifth past the interval.
+    vi.spyOn(Math, 'random').mockReturnValue(0.999);
+
+    await replica.startWorkers();
+    await replica.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
+    const afterFirstPass = listings.mock.calls.length;
+    expect(afterFirstPass).toBeGreaterThan(0);
+
+    // Node fires a timer whose delay is past 2^31-1 after 1 ms, which would start a pass per tick.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(listings).toHaveBeenCalledTimes(afterFirstPass);
+  });
+
   it('keeps renewing the lease of a run that outlives the lease TTL', async () => {
     // The lease renews on a setTimeout chain.
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });

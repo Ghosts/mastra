@@ -11,7 +11,7 @@ import type { Event } from '../../../events/types';
 import { Mastra } from '../../../mastra';
 import type { MastraRecoveryConfig } from '../../../mastra';
 import type { InMemoryStore } from '../../../storage/mock';
-import { runLivenessKey } from '../leases';
+import { restartLeaseKey, runLivenessKey } from '../leases';
 import { abandonLease } from './abandon-lease';
 import { createStep, createWorkflow } from '..';
 
@@ -240,6 +240,23 @@ export async function recordLeases(storage: Store) {
   };
 
   return { claims, reads, until };
+}
+
+/** Records every `restart()` of `runId` that got past the liveness check: each claims the restart lease. */
+export async function recordRestarts(storage: Store, runId: string) {
+  const store = (await storage.getStore('workflows'))!;
+  const claim = store.claimRunOwnership.bind(store);
+  const restarts: boolean[] = [];
+  vi.spyOn(store, 'claimRunOwnership').mockImplementation(async args => {
+    const result = await claim(args);
+    if (args.runId === restartLeaseKey(runId)) {
+      restarts.push(result.acquired);
+    }
+
+    return result;
+  });
+
+  return restarts;
 }
 
 /**

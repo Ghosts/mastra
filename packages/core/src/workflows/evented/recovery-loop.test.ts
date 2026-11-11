@@ -17,12 +17,13 @@ import type { Event } from '../../events/types';
 import { Mastra } from '../../mastra';
 import { InMemoryStore } from '../../storage/mock';
 import { WORKFLOW_RUN_LEASE_TTL_MS } from '../run-ownership';
-import { restartLeaseKey, runLivenessKey, stepOccurrenceKey } from './leases';
+import { runLivenessKey, stepOccurrenceKey } from './leases';
 import {
   Num,
   crash,
   interceptWorkflowEvents,
   isStepRunAt,
+  recordRestarts,
   replicas,
   runStatus,
   scanning,
@@ -61,22 +62,6 @@ async function readLivenessTogether(storage: Store, runId: string, count: number
     return readMany(args);
   });
   return together.promise;
-}
-
-/** Records every `restart()` of `runId` that got past the liveness check: each claims the restart lease. */
-async function recordRestarts(storage: Store, runId: string) {
-  const store = (await storage.getStore('workflows'))!;
-  const claim = store.claimRunOwnership.bind(store);
-  const restarts: boolean[] = [];
-  vi.spyOn(store, 'claimRunOwnership').mockImplementation(async args => {
-    const result = await claim(args);
-    if (args.runId === restartLeaseKey(runId)) {
-      restarts.push(result.acquired);
-    }
-
-    return result;
-  });
-  return restarts;
 }
 
 describe('evented recovery loop (#28712)', () => {

@@ -1,7 +1,8 @@
 /**
  * The run liveness key a process keeps fresh while it runs steps of an evented
- * run (#28712): how often it is written, and that a slow store does not get
- * overlapping renewals. Leases use a short TTL here, read when core loads.
+ * run (#28712): how often it is written, that a slow store does not get
+ * overlapping renewals, and what shutdown does with it. Leases use a short TTL
+ * here, read when core loads.
  */
 vi.hoisted(() => {
   process.env.MASTRA_AGENT_THREAD_LEASE_TTL_MS = '600';
@@ -10,10 +11,25 @@ vi.hoisted(() => {
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { createWorkflow } from '..';
+import { EventEmitterPubSub } from '../../../events/event-emitter';
 import { InMemoryStore } from '../../../storage/mock';
 import { WORKFLOW_RUN_LEASE_RENEW_INTERVAL_MS, WORKFLOW_RUN_LEASE_TTL_MS } from '../../run-ownership';
-import { Num, recordLeases, startReplica, stopReplicas, work } from '../test-utils/lease-replicas';
-import type { Built } from '../test-utils/lease-replicas';
+import {
+  Num,
+  interceptWorkflowEvents,
+  isStepRunAt,
+  recordLeases,
+  recordRestarts,
+  runIsLive,
+  runStatus,
+  scanning,
+  sleep,
+  startReplica,
+  stopReplicas,
+  track,
+  work,
+} from '../test-utils/lease-replicas';
+import type { Built, Report } from '../test-utils/lease-replicas';
 import { acquireStepLease, runLivenessKey, stepOccurrenceKey } from '.';
 import type { StepLease } from '.';
 
@@ -79,4 +95,72 @@ describe('evented run liveness (#28712)', () => {
       vi.useRealTimers();
     }
   });
+});
+
+describe('with an in-process pubsub, a run whose next step event was lost while its process still keeps it live (#28712)', () => {
+  const twoSteps = (report: Report) =>
+    createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num })
+      .then(work('first', report))
+      .then(work('second', report))
+      .commit() as unknown as Built;
+
+  /** A replica whose second step event of the `leased` run is lost, and the run it lost it for. */
+  async function loseSecondStep(storage: InMemoryStore, tracked: ReturnType<typeof track>) {
+    const lost = Promise.withResolvers<void>();
+    const pubsub = interceptWorkflowEvents(new EventEmitterPubSub(), event =>
+      isStepRunAt(event, [1]) && !(event.data as { restart?: unknown }).restart
+        ? { divert: () => lost.resolve() }
+        : undefined,
+    );
+    const a = await startReplica(storage, twoSteps(tracked.reporter('A')), { pubsub });
+    const run = await a.workflow.createRun();
+    void run.start({ inputData: { n: 1 } });
+    await lost.promise;
+    expect(await runIsLive(storage, run.runId)).toBe(true);
+
+    return { a, run };
+  }
+
+  it.each([
+    ['A shut down before B booted', true],
+    ['B booted before A shut down', false],
+  ] as const)(
+    'is restarted once its process shut down: %s',
+    async (_, shutDownFirst) => {
+      const storage = new InMemoryStore();
+      const tracked = track({ blocks: [] });
+      const { a, run } = await loseSecondStep(storage, tracked);
+
+      // Well within one lease TTL, so A's key would still be live had A not released it.
+      if (shutDownFirst) {
+        await a.mastra.shutdown({ drainTimeout: 0 });
+      }
+
+      await startReplica(storage, twoSteps(tracked.reporter('B')), { recovery: scanning });
+      if (!shutDownFirst) {
+        await sleep(scanning.workflowScanIntervalMs * 3);
+        expect(await runStatus(storage, run.runId)).toBe('running');
+        await a.mastra.shutdown({ drainTimeout: 0 });
+      }
+
+      await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), {
+        timeout: WORKFLOW_RUN_LEASE_TTL_MS / 2,
+        interval: 20,
+      });
+      expect(tracked.executions).toEqual(['A:first', 'B:second']);
+    },
+    20_000,
+  );
+
+  it('is left alone while that process runs, which may be a replica driving its own runs', async () => {
+    const storage = new InMemoryStore();
+    const tracked = track({ blocks: [] });
+    const { run } = await loseSecondStep(storage, tracked);
+    const restarts = await recordRestarts(storage, run.runId);
+
+    await startReplica(storage, twoSteps(tracked.reporter('B')), { recovery: scanning });
+    await sleep(WORKFLOW_RUN_LEASE_TTL_MS * 2);
+    expect(restarts).toEqual([]);
+    expect(tracked.executions).toEqual(['A:first']);
+  }, 20_000);
 });

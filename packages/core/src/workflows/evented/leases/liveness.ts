@@ -6,6 +6,7 @@
 import type { IMastraLogger } from '../../../logger';
 import type { WorkflowsStorage } from '../../../storage/domains/workflows/base';
 import { runOutsideRunFenceScope } from '../../../storage/run-fencing';
+import type { RunFence } from '../../../storage/run-fencing';
 import {
   WORKFLOW_RUN_LEASE_RENEW_INTERVAL_MS,
   WORKFLOW_RUN_LEASE_TTL_MS,
@@ -43,6 +44,8 @@ export class ProcessRunLiveness {
    * the quick steps that follow it do not write again.
    */
   readonly #lastWriteAt = new Map<string, number>();
+  /** The claim of each run's last write, kept while it may still be live so {@link release} can end it. */
+  readonly #claims = new Map<string, { store: WorkflowsStorage; fence: RunFence; writtenAt: number }>();
   readonly #writing = new Map<string, Promise<void>>();
   /** Stops the renewal timer; set while it runs. */
   #stopTimer?: () => void;
@@ -134,9 +137,9 @@ export class ProcessRunLiveness {
 
   /**
    * Marks the run live for one more lease TTL, or joins the write already in
-   * flight for it. Every process force-claims the key and nobody releases it,
-   * so its generation only orders the writes: no write is fenced on it and
-   * losing it to another process's write changes nothing.
+   * flight for it. Every process force-claims the key, and only a process that
+   * shut down releases it, so its generation only orders the writes: no write
+   * is fenced on it and losing it to another process's write changes nothing.
    *
    * Never rejects: a failed write is logged here and leaves the last write
    * time alone, so the next leaf start or tick tries again. Skipped once the
@@ -156,13 +159,18 @@ export class ProcessRunLiveness {
     const startedAt = Date.now();
     const write = (async () => {
       try {
-        await store.claimRunOwnership({
+        const { record } = await store.claimRunOwnership({
           runId: runLivenessKey(runId),
           ownerId: this.#ownerId,
           leaseMs: WORKFLOW_RUN_LEASE_TTL_MS,
           force: true,
         });
         this.#lastWriteAt.set(runId, startedAt);
+
+        if (record) {
+          const fence = { runId: record.runId, ownerId: record.ownerId, generation: record.generation };
+          this.#claims.set(runId, { store, fence, writtenAt: startedAt });
+        }
       } catch (error) {
         this.logger?.warn('Failed to mark a workflow run live', { runId, error });
       } finally {
@@ -172,6 +180,26 @@ export class ProcessRunLiveness {
 
     this.#writing.set(runId, write);
     return write;
+  }
+
+  /**
+   * Releases the liveness key of every run this process wrote within a lease TTL, once it shut
+   * down. With an in-process pubsub nothing else can deliver those runs' messages, and a released
+   * key lets the instance that replaces this one restart them without waiting for the keys to
+   * lapse. A key another process wrote since is left alone by the release's fence.
+   */
+  async release(): Promise<void> {
+    await Promise.allSettled([...this.#writing.values()]);
+
+    const claims = [...this.#claims.values()].filter(claim => Date.now() - claim.writtenAt < WORKFLOW_RUN_LEASE_TTL_MS);
+    this.#claims.clear();
+    await forEachBounded(claims, LIVENESS_RENEW_CONCURRENCY, async ({ store, fence }) => {
+      try {
+        await store.releaseRunOwnership(fence);
+      } catch (error) {
+        this.logger?.warn('Failed to release the liveness of a workflow run', { runId: fence.runId, error });
+      }
+    });
   }
 
   /**
@@ -191,6 +219,13 @@ export class ProcessRunLiveness {
       const idle = !this.#active.has(runId);
       if (idle && this.#age(runId) >= LIVENESS_RENEW_INTERVAL_MS) {
         this.#lastWriteAt.delete(runId);
+      }
+    }
+
+    // A claim a lease TTL old has lapsed, so there is nothing left for release() to end.
+    for (const [runId, claim] of this.#claims) {
+      if (Date.now() - claim.writtenAt >= WORKFLOW_RUN_LEASE_TTL_MS) {
+        this.#claims.delete(runId);
       }
     }
 
@@ -243,4 +278,12 @@ export function markRunLive({
   logger?: IMastraLogger;
 }): Promise<void> {
   return processLiveness(scope, logger).markLive(runId, store);
+}
+
+/**
+ * Releases the liveness keys the process `scope` stands for wrote, once it shut down. See
+ * {@link ProcessRunLiveness.release}.
+ */
+export async function releaseRunLiveness(scope: LivenessScope): Promise<void> {
+  await livenessByProcess.get(scope)?.release();
 }

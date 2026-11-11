@@ -112,6 +112,7 @@ import {
   nestedRunLeaseKeys,
   nestedRunLive,
   nestedRunStoppedMidStep,
+  releaseRunLiveness,
   runLivenessKey,
   runningStepOccurrenceKeys,
   stoppedMidStep,
@@ -997,11 +998,13 @@ export class Mastra<
   // The workflow restarts recovery queued or runs; created in the constructor from `recovery.workflowConcurrency`.
   #workflowRecoveries!: WorkflowRecoveryQueue;
   // The recovery pass in flight per mode; a restartAllActiveWorkflowRuns() call of that mode joins it.
-  #workflowPasses = new Map<'orphaned' | 'all', Promise<Promise<void>[]>>();
+  #workflowPasses = new Map<'orphaned' | 'all', Promise<Promise<void>[] | null>>();
   // Whether the config set the scan interval, rather than the default that depends on the store.
   #workflowScanIntervalSet = false;
   // Set once this instance started its first `orphaned` recovery pass, its boot pass.
   #workflowBootPassStarted = false;
+  // Runs whose unparseable stored state recovery already logged, keyed by workflow and run id.
+  #unparseableRunsLogged = new Set<string>();
   // Set while the recovery loop runs; `timer` is its next tick.
   #workflowRecoveryLoop?: { timer?: ReturnType<typeof setTimeout> };
   #durableRecoveryRechecks = new Map<string, ReturnType<typeof setTimeout>>();
@@ -4494,9 +4497,12 @@ export class Mastra<
    * run in a sleep is restarted only by the instance's first such pass, its
    * boot pass, and left alone after it. The server's boot-time call uses this
    * mode and joins the first pass of the recovery loop `startWorkers()`
-   * started. Stores without run ownership support restart every active run in
-   * either mode. The claim `restart()` takes stays the final check, so a run
-   * another process took in between is still refused.
+   * started. A call made before `startWorkers()` is the boot pass itself, so
+   * an instance that runs no loop still applies the boot rules once. Stores
+   * without run ownership support restart every active run in either mode, as
+   * does an `orphaned` call whose run ownership probe failed. The claim
+   * `restart()` takes stays the final check, so a run another process took in
+   * between is still refused.
    *
    * A call made while a pass of the same mode is in flight waits for that pass
    * instead of reading the runs a second time. A run left alone is not checked
@@ -4505,14 +4511,22 @@ export class Mastra<
    */
   public async restartAllActiveWorkflowRuns(options: { mode?: 'orphaned' | 'all' } = {}): Promise<void> {
     if (!this.#shuttingDown) this.#workflowRecoveries.open();
-    await Promise.all(await this.#joinWorkflowRecoveryPass(options.mode ?? 'all', () => !this.#shuttingDown));
+    const proceed = () => !this.#shuttingDown;
+    const restarts =
+      (await this.#joinWorkflowRecoveryPass(options.mode ?? 'all', proceed)) ??
+      // The run fencing probe failed, so no lease tells an orphaned run apart. The call still
+      // sweeps, as it did before the recovery loop existed: on a store without run fencing it is
+      // the only sweep, and restart() checks each run's ownership itself.
+      (await this.#joinWorkflowRecoveryPass('all', proceed));
+    await Promise.all(restarts ?? []);
   }
 
   /**
    * Starts a recovery pass of `mode`, or joins the one in flight. An `orphaned` pass sweeps like
    * `all` on a store without run ownership support, where no lease tells an orphaned run apart.
+   * `null` when an `orphaned` pass could not tell whether the store supports run fencing.
    */
-  #joinWorkflowRecoveryPass(mode: 'orphaned' | 'all', proceed: () => boolean): Promise<Promise<void>[]> {
+  #joinWorkflowRecoveryPass(mode: 'orphaned' | 'all', proceed: () => boolean): Promise<Promise<void>[] | null> {
     let pass = this.#workflowPasses.get(mode);
     if (!pass) {
       pass = this.#recoverActiveWorkflowRuns(mode, proceed).finally(() => {
@@ -4531,9 +4545,13 @@ export class Mastra<
    * `all` picks every run no process keeps alive. `orphaned` picks the runs `#isOrphanedRun`
    * finds orphaned, and checks each again when it gets a recovery slot. Without run fencing every
    * pass is an `all` pass, since no lease tells an orphaned run apart; the recovery loop stops
-   * after its first pass on such a store.
+   * after its first pass on such a store. An `orphaned` pass whose fencing probe failed restarts
+   * nothing and resolves to `null`.
    */
-  async #recoverActiveWorkflowRuns(requested: 'orphaned' | 'all', proceed: () => boolean): Promise<Promise<void>[]> {
+  async #recoverActiveWorkflowRuns(
+    requested: 'orphaned' | 'all',
+    proceed: () => boolean,
+  ): Promise<Promise<void>[] | null> {
     const restarts: Promise<void>[] = [];
     const workflowsStore = await this.#storage?.getStore('workflows');
     if (!workflowsStore) {
@@ -4547,8 +4565,8 @@ export class Mastra<
         return undefined;
       });
     // An `all` pass loses only its pre-check (restart() probes again and decides per run); an
-    // `orphaned` pass cannot tell orphaned runs from running ones and waits for the next one.
-    if (probed === undefined && requested === 'orphaned') return restarts;
+    // `orphaned` pass cannot tell orphaned runs from running ones and leaves the decision to its caller.
+    if (probed === undefined && requested === 'orphaned') return null;
     const readsOwnership = probed === true;
     const mode = readsOwnership ? requested : 'all';
     // This instance's first `orphaned` pass is its boot pass, which the deployer's boot-time call joins.
@@ -4634,8 +4652,9 @@ export class Mastra<
    * shows running. A failed read picks none: the next tick reads again.
    *
    * A listed run whose stored state cannot be parsed is picked unless its key is live: none of
-   * the rules can judge it, and skipping it would leave it unrecovered on every pass without a
-   * trace. `restart()` reads the run again and decides; a run that fails there is logged.
+   * the rules can judge it, and skipping it would leave it unrecovered on every pass. The parse
+   * failure is logged the first time a pass reads the run; `restart()` reads the run again and
+   * decides.
    */
   async #orphanedRuns(
     runs: WorkflowRuns['runs'],
@@ -4674,11 +4693,17 @@ export class Mastra<
     });
   }
 
-  /** `run`'s stored state, or `undefined` (logged) when it cannot be parsed. */
+  /**
+   * `run`'s stored state, or `undefined` when it cannot be parsed. The failure is logged the first
+   * time only, since the recovery loop reads the run again on every pass.
+   */
   #parsedSnapshot(run: WorkflowRuns['runs'][number]): WorkflowRunState | undefined {
     try {
       return typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot;
     } catch (error) {
+      const key = `${run.workflowName}\u0000${run.runId}`;
+      if (this.#unparseableRunsLogged.has(key)) return undefined;
+      this.#unparseableRunsLogged.add(key);
       this.#logger.warn('Failed to read the stored state of a workflow run before restarting it', {
         workflow: run.workflowName,
         runId: run.runId,
@@ -4719,7 +4744,9 @@ export class Mastra<
    *   than a lease lasts; that run, like one between steps, waits for the stall rule below.
    * - On the `boot` pass with a pubsub that lives in this process only (`EventEmitterPubSub`), an
    *   evented run whose liveness lapsed is restarted: the messages it waited for died with the
-   *   process that published them.
+   *   process that published them. So is one whose liveness was released, on any pass: such a
+   *   process releases the keys it wrote when it shuts down. A key another process keeps live is
+   *   left alone even then, since that process may be a replica driving its own runs.
    * - Otherwise an evented run in a sleep is left alone: it holds no lease until its timer
    *   wakes it. The instance's `boot` pass restarts it instead, since the process whose timer
    *   would wake it may be the one that stopped; the restart replays the sleep.
@@ -4763,8 +4790,12 @@ export class Mastra<
         // A nested run doing the run's work keeps its own liveness and writes its own row.
         if (nestedRunLive(nested, nestedLeases)) return false;
         // With a pubsub that lives in this process only, the messages of a run whose liveness
-        // lapsed before this instance started died with the process that published them.
-        if (boot && owner !== undefined && this.#pubsub.__rawBus() instanceof EventEmitterPubSub) return true;
+        // lapsed before this instance started died with the process that published them. A
+        // released key means its process shut down, so that holds on any pass.
+        const released = owner !== undefined && owner.leaseExpiresAt === null;
+        if ((boot ? owner !== undefined : released) && this.#pubsub.__rawBus() instanceof EventEmitterPubSub) {
+          return true;
+        }
         if (isRunAsleep(snapshot, nested)) return boot;
         const lastWrite = lastWriteOf(new Date(run.updatedAt).getTime(), nested);
         return now - lastWrite >= this.#recoveryConfig.workflowStallThresholdMs!;
@@ -8604,6 +8635,10 @@ export class Mastra<
 
     // SchedulerWorker is stopped as part of stopWorkers().
     await this.stopWorkers({ drainTimeout: Math.max(0, deadline - Date.now()) });
+    // With an in-process pubsub, the messages of the evented runs this process drove die with it.
+    // Releasing their liveness lets the instance that replaces it restart them without waiting
+    // for the keys to lapse. With a broker another worker may still take those messages up.
+    if (this.#pubsub.__rawBus() instanceof EventEmitterPubSub) await releaseRunLiveness(this);
 
     // Stop — don't destroy — registered workspaces. Remote sandboxes
     // suspend/pause and stay resumable across process restarts, and
