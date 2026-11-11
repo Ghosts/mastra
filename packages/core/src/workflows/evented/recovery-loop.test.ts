@@ -245,6 +245,50 @@ describe('evented recovery loop (#28712)', () => {
     20_000,
   );
 
+  it('restarts a parallel run whose branch crashed mid-step while its other branch sleeps for a day', async () => {
+    const storage = new InMemoryStore();
+    const store = (await storage.getStore('workflows'))!;
+    const tracked = track({ blocks: ['work'] }, { hangForever: true });
+    const build = (report: Report) => {
+      const sleeper = createWorkflow({ id: 'sleeper', inputSchema: Num, outputSchema: Num })
+        .sleep(24 * 60 * 60 * 1000)
+        .commit();
+      const worker = createWorkflow({ id: 'worker', inputSchema: Num, outputSchema: Num })
+        .then(work('work', report))
+        .commit();
+      return {
+        parent: createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: z.any() })
+          .parallel([sleeper, worker])
+          .commit() as unknown as Built,
+        nested: { sleeper, worker } as unknown as Record<string, Built>,
+      };
+    };
+    const onA = build(tracked.reporter('A'));
+    const onB = build(tracked.reporter('B'));
+    const a = await startReplica(storage, onA.parent, { nested: onA.nested });
+    await startReplica(storage, onB.parent, { nested: onB.nested, recovery: scanning });
+    const run = await a.workflow.createRun();
+    void run.start({ inputData: { n: 1 } });
+    await tracked.allBlocked;
+    const nestedRunId = async (stepId: string) =>
+      ((await store.loadWorkflowSnapshot({ workflowName: 'leased', runId: run.runId }))?.context[stepId] as any)
+        ?.metadata?.nestedRunId as string;
+    await vi.waitFor(async () => expect(await nestedRunId('sleeper')).toBeTruthy());
+    const workerRunId = await nestedRunId('worker');
+    const sleeperRunId = await nestedRunId('sleeper');
+
+    // A crashes while its worker branch runs a step and its sleeper branch sleeps.
+    await crash(a, storage, [
+      stepOccurrenceKey(workerRunId, [0]),
+      runLivenessKey(workerRunId),
+      runLivenessKey(sleeperRunId),
+      runLivenessKey(run.runId),
+    ]);
+
+    // B's loop restarts the run for the crashed branch, without waiting for the sleep.
+    await vi.waitFor(() => expect(tracked.executions).toEqual(['A:work', 'B:work']), { timeout: 10_000 });
+  }, 20_000);
+
   it('restarts no other run when a restart() starts the workers of an instance that never called startWorkers()', async () => {
     const storage = new InMemoryStore();
     const tracked = track({ blocks: ['a'] }, { hangForever: true });

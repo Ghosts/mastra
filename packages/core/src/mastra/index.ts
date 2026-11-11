@@ -4684,7 +4684,8 @@ export class Mastra<
    * and, for an evented run, the leases of the steps its stored state shows running.
    *
    * - A run whose key is live is driven by another process.
-   * - An evented run in a sleep is left alone: it holds no lease until its timer wakes it.
+   * - An evented run in a sleep is left alone, unless one of its other steps crashed (below): it
+   *   holds no lease until its timer wakes it.
    * - An evented run with a step whose lease was never released and has lapsed lost the worker
    *   running it, and is restarted at once; so is a run whose liveness lapsed while a nested run
    *   it drives lost the worker running one of its steps. A released step lease means the step finished and
@@ -4713,10 +4714,13 @@ export class Mastra<
       const unwrittenFor = now - new Date(run.updatedAt).getTime();
       const stalled = unwrittenFor >= this.#recoveryConfig.workflowStallThresholdMs!;
       if (evented) {
-        if (await isRunAsleep({ store: workflowsStore, snapshot })) return false;
-        if (stoppedMidStep(run.runId, snapshot, leases) || stalled) return true;
+        // A crashed step is restarted even while another branch sleeps: the restart replays that
+        // sleep, while deferring to it could leave the crashed branch for as long as the sleep lasts.
+        if (stoppedMidStep(run.runId, snapshot, leases)) return true;
         // A step that drives a nested run holds no lease; the nested run's own step leases tell.
-        return owner !== undefined && (await nestedRunStoppedMidStep({ store: workflowsStore, snapshot }));
+        if (owner !== undefined && (await nestedRunStoppedMidStep({ store: workflowsStore, snapshot }))) return true;
+        if (await isRunAsleep({ store: workflowsStore, snapshot })) return false;
+        return stalled;
       }
       if (owner?.leaseExpiresAt) return now - owner.leaseExpiresAt.getTime() >= WORKFLOW_RUN_LEASE_TTL_MS;
       if (owner && !hasSuspendedStep(snapshot)) return unwrittenFor >= WORKFLOW_RUN_LEASE_TTL_MS;

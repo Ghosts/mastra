@@ -192,9 +192,9 @@ export async function nestedRunStoppedMidStep({
  * `sleep` or `sleepUntil` step. A sleep holds no lease: the process that
  * started it wakes the run with a timer, so a sleeping run looks orphaned to
  * anything that only reads leases. A sleep's result stays `waiting` after the
- * run moves on, so only a sleep the run still lists in `activeStepsPath`
- * counts. Nested runs are read from storage, at most one level per running
- * nested step.
+ * run moves on, so only a sleep the run lists in `activeStepsPath` at a path
+ * within its current `activePaths` counts. Nested runs are read from storage,
+ * at most one level per running nested step.
  */
 export async function isRunAsleep({
   store,
@@ -210,7 +210,12 @@ export async function isRunAsleep({
 
     const steps = stepResultsOf(snapshot.context);
     const active = snapshot.activeStepsPath ?? {};
-    if (steps.some(([stepId, result]) => result?.status === 'waiting' && stepId in active)) {
+    // A sleep id can linger in `activeStepsPath` after the run moved on; only a sleep on the
+    // run's current path counts.
+    const activePaths = snapshot.activePaths ?? [];
+    const current = (path: number[] | undefined) =>
+      Array.isArray(path) && activePaths.length > 0 && activePaths.every((index, i) => path[i] === index);
+    if (steps.some(([stepId, result]) => result?.status === 'waiting' && current(active[stepId]))) {
       return true;
     }
 
