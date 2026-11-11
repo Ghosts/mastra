@@ -3184,6 +3184,7 @@ export class Agent<
           source: 'agent',
           agentId: this.id,
           agentName: this.name,
+          agentSource: this.source,
         });
       }
 
@@ -4786,6 +4787,7 @@ export class Agent<
         source: 'agent',
         agentId: this.id,
         agentName: this.name,
+        agentSource: this.source,
       });
     }
   }
