@@ -175,6 +175,38 @@ describe('recovery of evented runs in a sleep (#30012)', () => {
     expect(seen.state).toMatchObject({ scheduled: true });
   }, 20_000);
 
+  it('restart() keeps the stored wake time of a sleep whose process stopped before it stored the run at the sleep', async () => {
+    const storage = new InMemoryStore();
+    const store = (await storage.getStore('workflows'))!;
+    const seen = observe('leased');
+    const a = await startReplica(storage, sleepingFor(1_500)(seen.reporter('A')));
+    const b = await startReplica(storage, sleepingFor(1_500)(seen.reporter('B')), { recovery: { workflows: 'off' } });
+    const run = await a.workflow.createRun();
+    startInBackground(run, { n: 1 });
+    await sleepingRunId(storage, run.runId);
+    await crash(a, storage, [runLivenessKey(run.runId)]);
+
+    // A stopped after storing the sleep's result, before it stored the run's path at the sleep.
+    const snapshot = (await store.loadWorkflowSnapshot({ workflowName: 'leased', runId: run.runId }))!;
+    const sleepId = Object.keys(snapshot.context).find(id => id.startsWith('sleep_'))!;
+    const { [sleepId]: _sleep, ...activeStepsPath } = snapshot.activeStepsPath;
+    await store.persistWorkflowSnapshot({
+      workflowName: 'leased',
+      runId: run.runId,
+      snapshot: { ...snapshot, activePaths: [0], activeStepsPath },
+    });
+
+    await sleep(Math.max(0, seen.at['A:before']! + 700 - Date.now()));
+    const restartedAt = Date.now();
+    const result = await (await b.workflow.createRun({ runId: run.runId })).restart();
+
+    expect(result.status).toBe('success');
+    expect(seen.executions).toEqual(['A:before', 'B:after']);
+    // The restart waited for the rest of the stored sleep, not for a whole new one.
+    expect(seen.at['B:after']! - Math.max(seen.at['A:before']! + 1_500, restartedAt)).toBeLessThan(500);
+    expect(sleepStatuses(result.steps)).toEqual(['success']);
+  }, 20_000);
+
   it('leaves a sleep stored without a wake time to the timer that started it', async () => {
     const storage = new InMemoryStore();
     const store = (await storage.getStore('workflows'))!;

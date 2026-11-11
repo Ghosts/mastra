@@ -418,7 +418,9 @@ async function setUpSleep(
     workflowName: workflowId,
     runId,
     stepId,
-    result: { status: 'waiting', payload, startedAt, metadata: { wakeAt } },
+    // The path goes with the wake time: the run's own write of its path at the sleep comes after
+    // this one, and a process that stops in between leaves only this one (see sleepInProgress).
+    result: { status: 'waiting', payload, startedAt, metadata: { wakeAt, path: executionPath } },
     requestContext: withoutAuthToken(requestContext ?? {}),
     state: changedState,
   });
@@ -533,8 +535,10 @@ function leftSleep(snapshot: WorkflowRunState, executionPath: number[], timeTrav
  * result with a stored wake time that the run lists as active at that path.
  * The result stored under `stepId` is preferred; otherwise one is matched by
  * path, because a sleep declared without an `id` gets a new generated id in
- * every process that builds the workflow. A sleep recorded before wake times
- * were stored is not resumed.
+ * every process that builds the workflow. A result the run lists at no path is
+ * matched by the path stored with it: its process stopped after storing the
+ * result and before storing the run's path at the sleep. A sleep recorded
+ * before wake times were stored is not resumed.
  */
 function sleepInProgress(
   snapshot: WorkflowRunState,
@@ -542,12 +546,21 @@ function sleepInProgress(
   stepId: string,
 ): SleepOccurrence | undefined {
   const active = snapshot.activeStepsPath ?? {};
-  const ids = [stepId, ...Object.keys(active).filter(id => id !== stepId)];
+  const ids = [...new Set([stepId, ...Object.keys(active), ...Object.keys(snapshot.context ?? {})])];
 
   for (const id of ids) {
     const stored = snapshot.context?.[id];
     const wakeAt = storedWakeAt(stored);
-    if (!samePath(active[id], executionPath) || stored?.status !== 'waiting' || wakeAt === undefined) {
+    if (stored?.status !== 'waiting' || wakeAt === undefined) {
+      continue;
+    }
+
+    // A result the run lists at another path is another sleep's, whatever path it stored.
+    const atPath =
+      active[id] === undefined
+        ? samePath((stored.metadata as { path?: number[] } | undefined)?.path, executionPath)
+        : samePath(active[id], executionPath);
+    if (!atPath) {
       continue;
     }
 
@@ -801,7 +814,7 @@ async function revertWake(args: ProcessorArgs, deps: SleepDeps, occurrence: Slee
       status: 'waiting',
       payload: occurrence.payload,
       startedAt: occurrence.startedAt,
-      metadata: { wakeAt: occurrence.wakeAt },
+      metadata: { wakeAt: occurrence.wakeAt, path: args.executionPath },
     },
     requestContext: withoutAuthToken(requestContext ?? {}),
   });
