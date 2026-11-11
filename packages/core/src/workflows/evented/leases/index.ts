@@ -1,6 +1,6 @@
 /** Evented engine leases: step occurrence leases, run liveness and the `restart()` check. */
 export { restartLeaseKey, runLivenessKey, stepOccurrenceKey } from './keys';
-export { markRunLive, releaseRunLiveness } from './liveness';
+export { endRunLiveness, markRunLive } from './liveness';
 export type { LivenessScope } from './liveness';
 export * from './recovery-state';
 export { claimEventedRestart } from './restart';

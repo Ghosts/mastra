@@ -106,13 +106,13 @@ import {
   toJsonSchemaOrUndefined,
 } from '../workflows/dynamic';
 import {
+  endRunLiveness,
   isRunAsleep,
   lastWriteOf,
   loadNestedRuns,
   nestedRunLeaseKeys,
   nestedRunLive,
   nestedRunStoppedMidStep,
-  releaseRunLiveness,
   runLivenessKey,
   runningStepOccurrenceKeys,
   stoppedMidStep,
@@ -8668,10 +8668,12 @@ export class Mastra<
 
     // SchedulerWorker is stopped as part of stopWorkers().
     await this.stopWorkers({ drainTimeout: Math.max(0, deadline - Date.now()) });
-    // With an in-process pubsub, the messages of the evented runs this process drove die with it.
-    // Releasing their liveness lets the instance that replaces it restart them without waiting
-    // for the keys to lapse. With a broker another worker may still take those messages up.
-    if (this.#pubsub.__rawBus() instanceof EventEmitterPubSub) await releaseRunLiveness(this);
+    // The evented runs this process drove were kept live through the drain above, so no instance
+    // restarted one it still drove; from here on they can be recovered. With an in-process pubsub
+    // their messages die with this process, and releasing their liveness lets the instance that
+    // replaces it restart them without waiting for the keys to lapse. With a broker another worker
+    // may still take those messages up.
+    await endRunLiveness(this, { release: this.#pubsub.__rawBus() instanceof EventEmitterPubSub });
 
     // Stop — don't destroy — registered workspaces. Remote sandboxes
     // suspend/pause and stay resumable across process restarts, and

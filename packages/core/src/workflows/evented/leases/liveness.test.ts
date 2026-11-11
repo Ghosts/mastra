@@ -166,6 +166,28 @@ describe('with an in-process pubsub, a run whose next step event was lost while 
     20_000,
   );
 
+  it('keeps a run live while its process drains it on shutdown, so a booting instance leaves it alone', async () => {
+    const storage = new InMemoryStore();
+    const tracked = track({ blocks: ['first'] });
+    const a = await startReplica(storage, twoSteps(tracked.reporter('A')));
+    const run = await a.workflow.createRun();
+    const result = run.start({ inputData: { n: 1 } });
+    await tracked.allBlocked;
+    const restarts = await recordRestarts(storage, run.runId);
+
+    // The drain outlasts a lease TTL, and B boots meanwhile.
+    const shutdown = a.mastra.shutdown({ drainTimeout: WORKFLOW_RUN_LEASE_TTL_MS * 6 });
+    await sleep(WORKFLOW_RUN_LEASE_TTL_MS * 1.5);
+    await startReplica(storage, twoSteps(tracked.reporter('B')), { recovery: scanning });
+    await sleep(scanning.workflowScanIntervalMs * 3);
+    expect(restarts).toEqual([]);
+
+    tracked.release();
+    expect((await result).status).toBe('success');
+    await shutdown;
+    expect(tracked.executions).toEqual(['A:first', 'A:second']);
+  }, 20_000);
+
   it('releases a liveness key whose write took longer than a lease TTL', async () => {
     const storage = new InMemoryStore();
     const store = (await storage.getStore('workflows'))!;

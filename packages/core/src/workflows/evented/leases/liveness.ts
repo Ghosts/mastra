@@ -17,7 +17,7 @@ import { runLivenessKey } from './keys';
 
 /** The process a step runs in, as seen by the liveness bookkeeping. */
 export interface LivenessScope {
-  /** True once the process started shutting down; it stops renewing liveness and waiting for leases then. */
+  /** True once the process started shutting down; it stops waiting for leases then. */
   readonly __shuttingDown: boolean;
 }
 
@@ -44,9 +44,11 @@ export class ProcessRunLiveness {
    * the quick steps that follow it do not write again.
    */
   readonly #lastWriteAt = new Map<string, number>();
-  /** The claim of each run's last write, kept while it may still be live so {@link release} can end it. */
+  /** The claim of each run's last write, kept while it may still be live so {@link end} can release it. */
   readonly #claims = new Map<string, { store: WorkflowsStorage; fence: RunFence; writtenAt: number }>();
   readonly #writing = new Map<string, Promise<void>>();
+  /** False once {@link end} ran: this process writes no liveness key after that. */
+  #vouching = true;
   /** Stops the renewal timer; set while it runs. */
   #stopTimer?: () => void;
 
@@ -143,11 +145,11 @@ export class ProcessRunLiveness {
    *
    * Never rejects: a failed write is logged here and leaves the last write
    * time alone, so the next leaf start or tick tries again. Skipped once the
-   * process is shutting down: it stops vouching for its runs then, so they can
-   * be recovered once their keys lapse.
+   * process stopped vouching for its runs (see {@link end}), so they can be
+   * recovered once their keys lapse.
    */
   #write(runId: string, store: WorkflowsStorage): Promise<void> {
-    if (this.scope.__shuttingDown) {
+    if (!this.#vouching) {
       return Promise.resolve();
     }
 
@@ -185,22 +187,35 @@ export class ProcessRunLiveness {
   }
 
   /**
-   * Releases the liveness key of every run this process wrote within a lease TTL, once it shut
-   * down. With an in-process pubsub nothing else can deliver those runs' messages, and a released
-   * key lets the instance that replaces this one restart them without waiting for the keys to
-   * lapse. A key another process wrote since is left alone by the release's fence.
+   * Stops vouching for this process's runs once its shutdown drained them: no liveness key is
+   * written after this, so a step still running past the drain lets its run be recovered once
+   * the key lapses. Until then the keys stay fresh, so no instance restarts a run this process
+   * still drives.
+   *
+   * With `release`, also releases the key of every run this process wrote within a lease TTL.
+   * With an in-process pubsub nothing else can deliver those runs' messages, and a released key
+   * lets the instance that replaces this one restart them without waiting for the keys to lapse.
+   * A key another process wrote since is left alone by the release's fence. Two instances in one
+   * process that share one in-process pubsub are the exception: the other one may restart the
+   * released runs while the shared pubsub still delivers their messages, and step leases and the
+   * finished-step check keep each step from running twice.
    *
    * Waits at most one renew interval, so a slow store cannot hold up the rest of shutdown. A key
    * not released by then lapses as it would have without the release.
    */
-  async release(): Promise<void> {
+  async end(release: boolean): Promise<void> {
+    this.#vouching = false;
+    this.#active.clear();
+    this.#lastWriteAt.clear();
+
     // Never rejects: each release logs its own failure.
     const releasing = (async () => {
+      // A write in flight lands after this, so its claim must be known before releasing.
       await Promise.allSettled([...this.#writing.values()]);
 
-      const claims = [...this.#claims.values()].filter(
-        claim => Date.now() - claim.writtenAt < WORKFLOW_RUN_LEASE_TTL_MS,
-      );
+      const claims = release
+        ? [...this.#claims.values()].filter(claim => Date.now() - claim.writtenAt < WORKFLOW_RUN_LEASE_TTL_MS)
+        : [];
       this.#claims.clear();
       await forEachBounded(claims, LIVENESS_RENEW_CONCURRENCY, async ({ store, fence }) => {
         try {
@@ -221,9 +236,10 @@ export class ProcessRunLiveness {
 
     try {
       if (await Promise.race([releasing, timedOut])) {
-        this.logger?.warn('Stopped waiting for the liveness of workflow runs to be released during shutdown', {
-          timeoutMs: LIVENESS_RENEW_INTERVAL_MS,
-        });
+        this.logger?.warn(
+          'Stopped waiting for the liveness of workflow runs to be written or released during shutdown',
+          { timeoutMs: LIVENESS_RENEW_INTERVAL_MS },
+        );
       }
     } finally {
       clearTimeout(timer);
@@ -236,12 +252,6 @@ export class ProcessRunLiveness {
    * interval old, and stops the timer once nothing is left to track.
    */
   async #renew() {
-    // A process shutting down stops vouching for its runs, so they can be recovered once the keys lapse.
-    if (this.scope.__shuttingDown) {
-      this.#active.clear();
-      this.#lastWriteAt.clear();
-    }
-
     // A finished run's last write time is kept for one interval so its next quick step skips the write.
     for (const runId of this.#lastWriteAt.keys()) {
       const idle = !this.#active.has(runId);
@@ -250,7 +260,7 @@ export class ProcessRunLiveness {
       }
     }
 
-    // A claim a lease TTL old has lapsed, so there is nothing left for release() to end.
+    // A claim a lease TTL old has lapsed, so there is nothing left for end() to release.
     for (const [runId, claim] of this.#claims) {
       if (Date.now() - claim.writtenAt >= WORKFLOW_RUN_LEASE_TTL_MS) {
         this.#claims.delete(runId);
@@ -309,9 +319,9 @@ export function markRunLive({
 }
 
 /**
- * Releases the liveness keys the process `scope` stands for wrote, once it shut down. See
- * {@link ProcessRunLiveness.release}.
+ * Stops the process `scope` stands for from vouching for its runs once its shutdown drained
+ * them, and with `release` releases the liveness keys it wrote. See {@link ProcessRunLiveness.end}.
  */
-export async function releaseRunLiveness(scope: LivenessScope): Promise<void> {
-  await livenessByProcess.get(scope)?.release();
+export async function endRunLiveness(scope: LivenessScope, { release }: { release: boolean }): Promise<void> {
+  await livenessByProcess.get(scope)?.end(release);
 }
