@@ -319,23 +319,36 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
     expect(claims.mock.calls.filter(([args]) => args.runId === run.runId)).toHaveLength(1);
   });
 
-  it('fails a direct resume of a nested run whose parent lease cannot be claimed, and leaves the parent suspended', async () => {
-    const storage = new InMemoryStore();
-    const executions: string[] = [];
-    const { run, workflowsStore, resume } = await suspendedInChild(storage, executions);
-    const claim = workflowsStore.claimRunOwnership.bind(workflowsStore);
-    vi.spyOn(workflowsStore, 'claimRunOwnership').mockImplementation(async args => {
-      if (args.runId === run.runId) {
-        throw new Error('store unavailable');
-      }
+  it.each([
+    ['the claim throws', 'store unavailable'],
+    // A forced claim can still be refused, for example when retention deletes the record mid-claim.
+    ['the store refuses the claim', /Failed to claim the lease of parent workflow run/],
+  ] as const)(
+    'fails a direct resume of a nested run whose parent lease cannot be claimed (%s), and leaves the parent suspended',
+    async (_, error) => {
+      const storage = new InMemoryStore();
+      const executions: string[] = [];
+      const { run, workflowsStore, resume } = await suspendedInChild(storage, executions);
+      const claim = workflowsStore.claimRunOwnership.bind(workflowsStore);
+      vi.spyOn(workflowsStore, 'claimRunOwnership').mockImplementation(async args => {
+        if (args.runId !== run.runId) {
+          return claim(args);
+        }
 
-      return claim(args);
-    });
+        if (error === 'store unavailable') {
+          throw new Error(error);
+        }
 
-    await expect(resume()).rejects.toThrow('store unavailable');
-    expect(executions).toEqual(['approve:suspended']);
-    expect(await workflowsStore.loadWorkflowRunStatus({ workflowName: 'parent', runId: run.runId })).toBe('suspended');
-  });
+        return { acquired: false, record: await workflowsStore.getRunOwnership({ runId: run.runId }) };
+      });
+
+      await expect(resume()).rejects.toThrow(error);
+      expect(executions).toEqual(['approve:suspended']);
+      expect(await workflowsStore.loadWorkflowRunStatus({ workflowName: 'parent', runId: run.runId })).toBe(
+        'suspended',
+      );
+    },
+  );
 
   it('does not restart a queued run that its owner took up again while it waited for a recovery slot', async () => {
     const storage = new InMemoryStore();

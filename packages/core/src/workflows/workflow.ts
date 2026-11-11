@@ -5884,13 +5884,18 @@ export class Run<
       // recovery loop must not restart it, and with it this run's step, while this run still works.
       // Only the caller that flipped the parent takes it: without the compare-and-set, concurrently
       // resumed siblings would take it from one another. A store without run fencing hands back a
-      // no-op lease; a store that fails the claim fails the resume, since running without the
-      // lease would leave the parent to the recovery loop.
+      // no-op lease; a store that fails or refuses the claim fails the resume, since running
+      // without the lease would leave the parent to the recovery loop.
       let parentLease: WorkflowRunOwnership | undefined;
       if (flippedParent) {
         try {
           const claim = await parentRun.#claimOwnership(true);
-          parentLease = 'release' in claim ? claim : undefined;
+          // Even a forced claim can be refused, for example when retention deletes the record mid-claim.
+          if (!('release' in claim)) {
+            throw new Error(`Failed to claim the lease of parent workflow run ${parentRun.runId}`);
+          }
+
+          parentLease = claim;
         } catch (error) {
           try {
             await parentRun.runStorage.updateHeader({ status: 'suspended', expectedStatus: 'running' });
