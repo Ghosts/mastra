@@ -421,7 +421,7 @@ Visit the [Configuration reference](/reference/configuration) for detailed docum
             isOptional: true,
             defaultValue: '5',
             description:
-              'Maximum number of workflow runs restarted at the same time by boot recovery and the recovery loop. Use `Infinity` for no limit. A default-engine run counts until it finishes, an evented run until a worker starts it, or `MASTRA_AGENT_THREAD_LEASE_TTL_MS` (15 seconds by default) after its restart was published. Workflow and durable agent recovery run in parallel.',
+              'Maximum number of workflow runs restarted at the same time by boot recovery and the recovery loop. Use `Infinity` for no limit. A default-engine run counts until it finishes, an evented run until a worker starts it, or `MASTRA_AGENT_THREAD_LEASE_TTL_MS` (15 seconds by default) after its restart was published. Long default-engine runs that fill every slot keep the instance from restarting anything else until one finishes. Workflow and durable agent recovery run in parallel.',
           },
           {
             name: 'workflowScanIntervalMs',
@@ -429,7 +429,7 @@ Visit the [Configuration reference](/reference/configuration) for detailed docum
             isOptional: true,
             defaultValue: '30000',
             description:
-              'How often, in milliseconds, an instance that runs workers checks storage for workflow runs whose process stopped. The first check runs when workers start. Each later check runs up to 20% earlier or later, so instances started together check at different times. Only storage adapters with run-ownership support run the repeated checks.',
+              "How often, in milliseconds, the [recovery loop](/docs/workflows/overview#recovery-loop) checks storage for workflow runs whose process stopped. The loop runs on an instance that called `startWorkers()` with the orchestration worker; an instance with `workers: false`, or with `MASTRA_WORKERS` leaving out `orchestration`, runs none. The first check runs when the workers start. Each later check runs up to 20% earlier or later, so instances started together check at different times. Storage adapters that don't page workflow runs by creation time read every run of a workflow on each check, so their default is 120000. Only storage adapters with run-ownership support run the repeated checks. Values are capped at 2147483647; set `workflows` to `'off'` to turn the loop off.",
           },
           {
             name: 'workflowStallThresholdMs',
@@ -437,7 +437,7 @@ Visit the [Configuration reference](/reference/configuration) for detailed docum
             isOptional: true,
             defaultValue: '300000',
             description:
-              'How long, in milliseconds, an active workflow run can go without a storage write and without a process keeping it alive before the recovery loop restarts it. This recovers a run whose next step message was lost.',
+              'How long, in milliseconds, an active workflow run can go without a storage write and without a process keeping it alive before the recovery loop restarts it. This recovers a run whose next step message was lost. A run whose process stopped in the middle of a step is restarted sooner. Keep it above four lease TTLs.',
           },
         ],
       },

@@ -514,33 +514,13 @@ workflow.restartAllActiveWorkflowRuns()
 
 Runs restart concurrently, up to `recovery.workflowConcurrency` at a time (default `5`). Set it to `1` in the Mastra config if your runs share side effects that must not run in parallel.
 
-To exclude a workflow from automatic boot-time restarts triggered by `Mastra.restartAllActiveWorkflowRuns()`, set `autoRestartActiveRuns: false` in the workflow's `options`. This is useful for workflows with side effects that must not be re-driven by a blanket restart. Durable agent workflows set this automatically because their recovery is owned by the opt-in `recovery.durableAgents: 'auto'` path.
+To exclude a workflow from automatic restarts by `Mastra.restartAllActiveWorkflowRuns()` and the recovery loop, set `autoRestartActiveRuns: false` in the workflow's `options`. This is useful for workflows with side effects that must not be re-driven by a blanket restart. Durable agent workflows set this automatically because their recovery is owned by the opt-in `recovery.durableAgents: 'auto'` path.
 
-While a run executes, Mastra holds a storage lease on it and renews it in the background. `restart()` refuses to take over a run whose lease hasn't expired: it throws a `WORKFLOW_RESTART_RUN_OWNED` error and the sweep skips the run. The lease is advisory and doesn't fence writes. If a process stops renewing its lease but keeps executing a step, for example because its event loop is blocked for longer than the lease TTL, recovery can run that step a second time. The boot-time sweep, `mastra.restartAllActiveWorkflowRuns()`, skips a run whose lease hasn't expired, and the [recovery loop](#recovery-loop) restarts it once the lease expires. `workflow.restartAllActiveWorkflowRuns()` skips the run too, so call it after the lease expires if you need to recover that run without the loop. Storage adapters without run-ownership support keep the previous behavior and restart every active run.
+While a run executes, Mastra holds a storage lease on it and renews it in the background. `restart()` refuses to take over a run whose lease hasn't expired: it throws a `WORKFLOW_RESTART_RUN_OWNED` error and the sweep skips the run. The lease is advisory and doesn't fence writes. If a process stops renewing its lease but keeps executing a step, for example because its event loop is blocked for longer than the lease TTL, recovery can run that step a second time. The boot-time restart, `mastra.restartAllActiveWorkflowRuns()`, skips a run whose lease hasn't expired, and the [recovery loop](#recovery-loop) restarts it later. `workflow.restartAllActiveWorkflowRuns()` skips the run too, so call it after the lease expires if you need to recover that run without the loop. Storage adapters without run-ownership support keep the previous behavior and restart every active run.
 
-On the evented engine, the worker running a step holds a lease on that step, and keeps a lease on the run fresh while any of its steps runs. `restart()` throws `WORKFLOW_RESTART_RUN_OWNED` while the run is starting (after `start()`, `resume()` or `timeTravel()` and before its first step begins), and while a step of the run, or of a nested workflow the run started, is running. It keeps throwing for up to `MASTRA_AGENT_THREAD_LEASE_TTL_MS` (15 seconds by default) after the run's last step finished. The boot-time sweep skips such a run, and the recovery loop checks it again later.
+On the evented engine, the worker running a step holds a lease on that step, and keeps a lease on the run fresh while any of its steps runs. `restart()` throws `WORKFLOW_RESTART_RUN_OWNED` while the run is starting (after `start()`, `resume()` or `timeTravel()` and before its first step begins), and while a step of the run, or of a nested workflow the run started, is running. It keeps throwing for up to `MASTRA_AGENT_THREAD_LEASE_TTL_MS` (15 seconds by default) after the run's last step finished. The boot-time restart skips such a run, and the recovery loop checks it again later.
 
 The evented engine stores one `workflows.runOwnership` record per step it runs, including each loop iteration and `foreach` item. Set a `workflows.runOwnership` retention policy and schedule `prune()` as described in [storage retention](/reference/storage/retention), or the table keeps growing.
-
-### Recovery loop
-
-An instance that runs workers, such as a server or a process that calls `mastra.startWorkers()`, keeps checking storage for orphaned runs while it runs. Its first check is the boot-time sweep. Later checks run every `recovery.workflowScanIntervalMs` (30 seconds by default), each up to 20% earlier or later, so instances started together check at different times. A check restarts:
-
-- A run whose process stopped while running it, once the run's lease expires. On the evented engine, that's a run with a step that was running when its worker stopped.
-- A run that no process keeps alive and that wasn't written to storage for `recovery.workflowStallThresholdMs` (5 minutes by default). This recovers an evented run whose next step message was lost. An evented run waiting for its next step message counts only after this threshold, so a slow broker doesn't make the loop restart runs.
-
-The loop skips evented runs in a `sleep()` or `sleepUntil()` step, because no lease keeps a sleeping run alive. It needs a storage adapter with run-ownership support, restarts at most `recovery.workflowConcurrency` runs at a time, and stops on `stopWorkers()` and `shutdown()`. `shutdown()` waits for the restarts already in progress. Set `recovery.workflows` to `'off'` to turn off both the boot-time sweep and the loop.
-
-```typescript title="src/mastra/index.ts"
-import { Mastra } from '@mastra/core/mastra'
-
-export const mastra = new Mastra({
-  recovery: {
-    workflowScanIntervalMs: 60_000,
-    workflowStallThresholdMs: 10 * 60_000,
-  },
-})
-```
 
 A restarted run runs the interrupted step again, even if that step finished before the process stopped but its result wasn't saved. On the evented engine, step leases apply when the storage adapter supports run ownership and the workflow doesn't set `autoRestartActiveRuns: false`. For those workflows, a step event that's redelivered while another worker runs the step waits for that worker, and runs the step only if that worker stops and its lease expires. Once the step's result is saved, a later event for the step, such as a late redelivery or the event of a restart that raced the step, continues the run from the saved result. The event is dropped when the run already moved past the step. In other evented workflows, including durable agent workflows, a step whose event is delivered again runs again. Make steps with side effects idempotent, so a repeated step has no additional effect.
 
@@ -553,6 +533,31 @@ Some steps need part of the key to come from their input:
 - A loop runs the same step on every iteration. Return an iteration number from the step and read it from the input on the next iteration. A repeated or resumed iteration receives the same input, so the number doesn't change.
 
 For tools that agents call, see [make tools safe to repeat](/docs/harness/durable-agents#make-tools-safe-to-repeat).
+
+### Recovery loop
+
+An instance that called `mastra.startWorkers()` with the orchestration worker, such as a server or a `mastra worker` process, keeps checking storage for orphaned runs while it runs. An instance with `workers: false`, or with `MASTRA_WORKERS` leaving out `orchestration`, runs no loop, and neither does a script whose workers only started on their own (for example, when it restarts a run or dispatches a background task). The first check runs when the workers start, and the boot-time `mastra.restartAllActiveWorkflowRuns()` call joins it. Later checks run every `recovery.workflowScanIntervalMs`, each up to 20% earlier or later, so instances started together check at different times. The interval defaults to 30 seconds on storage adapters that page workflow runs by creation time (Postgres, LibSQL, MySQL, MongoDB and the in-memory store) and to 2 minutes on the others, which read every run of a workflow on each check.
+
+A check restarts:
+
+- An evented run whose worker stopped in the middle of a step, as soon as that step's lease and the run's lease expire. This also covers a step of a nested workflow the run started.
+- A default-engine run one lease TTL (`MASTRA_AGENT_THREAD_LEASE_TTL_MS`, 15 seconds by default) after its lease expired. The grace keeps a process whose event loop was blocked for a moment from losing its run.
+- A run that no process keeps alive and that wasn't written to storage for `recovery.workflowStallThresholdMs` (5 minutes by default). This recovers an evented run whose next step message was lost. An evented run that waits for its next step message, for example while a busy broker holds it back, isn't restarted before this threshold.
+
+A sleeping run holds no lease; the process that started the sleep wakes it with a timer. The loop leaves evented runs in a `sleep()` or `sleepUntil()` step alone, so if that process stopped, the loop doesn't recover the run. The loop needs a storage adapter with run-ownership support, restarts at most `recovery.workflowConcurrency` runs at a time, honors `autoRestartActiveRuns: false`, and stops on `stopWorkers()` and `shutdown()`. `shutdown()` waits for the restarts already in progress. A default-engine run holds its slot until it finishes, so long runs that fill every slot keep the instance from restarting anything else until one of them finishes. Set `recovery.workflows` to `'off'` to turn off both the boot-time restart and the loop.
+
+```typescript title="src/mastra/index.ts"
+import { Mastra } from '@mastra/core/mastra'
+
+export const mastra = new Mastra({
+  recovery: {
+    workflowScanIntervalMs: 60_000,
+    workflowStallThresholdMs: 10 * 60_000,
+  },
+})
+```
+
+`mastra.restartAllActiveWorkflowRuns()` applies the same rules. Pass `{ mode: 'all' }` to restart every active run that no process keeps alive, including sleeping runs and runs that may only be waiting for their next step.
 
 ### Restarting an active workflow run with `restart()`
 

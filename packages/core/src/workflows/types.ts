@@ -574,7 +574,8 @@ export interface WorkflowOptions<TStorageVersion extends 1 | 2 = 1> {
   sharePubsub?: boolean;
   /**
    * Whether `Mastra.restartAllActiveWorkflowRuns()` (boot-time generic
-   * recovery) automatically restarts this workflow's active runs. Defaults to
+   * recovery) and the recovery loop that `startWorkers()` starts restart
+   * this workflow's active runs automatically. Defaults to
    * true. Set to false for workflows whose recovery is owned elsewhere or
    * whose side effects must not be re-driven by a blanket restart. Durable
    * agent workflows set this to false because their recovery is owned by the
