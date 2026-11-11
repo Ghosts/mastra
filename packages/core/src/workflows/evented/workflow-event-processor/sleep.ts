@@ -114,6 +114,9 @@ interface PendingWake {
 // The longest wait between attempts of a wake whose lease checks keep failing.
 const MAX_WAKE_RETRY_DELAY_MS = 5 * 60_000;
 
+// How long an interrupted wake waits for the lease it let lapse (a millisecond lease) to run out.
+const LAPSED_LEASE_MARGIN_MS = 10;
+
 /** The pending wakes of the sleeps each process started or resumed. */
 const pendingWakes = new WeakMap<LivenessScope, Set<PendingWake>>();
 /** The wakes each process put aside when its workers stopped, set again when they start. */
@@ -767,7 +770,8 @@ async function wakeSleep(args: ProcessorArgs, deps: SleepDeps, occurrence: Sleep
       // The timer that started this wake is gone, so the wake is kept for resumeSleepWakes. Its own
       // lease would hold the next attempt off for a lease TTL.
       await lease.lapse();
-      scheduleWake(args, deps, occurrence);
+      // The lapsed lease runs out a millisecond later; an attempt within it would find it held.
+      scheduleWake(args, deps, occurrence, { attempt, notBefore: Date.now() + LAPSED_LEASE_MARGIN_MS });
     } else {
       // Left to lapse, so another wake can claim the occurrence once this one is surely gone.
       lease?.abandon();
