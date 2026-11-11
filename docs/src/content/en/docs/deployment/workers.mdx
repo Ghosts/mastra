@@ -408,7 +408,7 @@ If the API crashes while a step is executing, that work can be lost and the work
 
 - **No dead-letter queue**: Failed events are nacked and retried, but there's no DLQ for events that fail after all retries.
 - **Scheduler is single-instance**: Running multiple scheduler processes causes duplicate schedule fires.
-- **Runs left in "running" after API crash**: A crash during workflow-step execution leaves the run in `running` status until the orchestration worker's [recovery loop](/docs/workflows/overview#recovery-loop) finds it orphaned, which can take up to `recovery.workflowStallThresholdMs` (5 minutes by default). For [durable agents](/docs/harness/durable-agents), configure `recovery.durableAgents: 'auto'` so a server restart automatically re-drives orphaned runs. See [Crash recovery](/docs/harness/durable-agents#crash-recovery) for details.
+- **Runs left in "running" after API crash**: A crash during workflow-step execution leaves the run in `running` status until the orchestration worker's [recovery loop](/docs/workflows/overview#recovery-loop) finds it orphaned. Unless the loop sees that a step's worker stopped, a run becomes eligible only once it went `recovery.workflowStallThresholdMs` (5 minutes by default) without a write, and is restarted on a check after that. For [durable agents](/docs/harness/durable-agents), configure `recovery.durableAgents: 'auto'` so a server restart automatically re-drives orphaned runs. See [Crash recovery](/docs/harness/durable-agents#crash-recovery) for details.
 
 ## Related
 

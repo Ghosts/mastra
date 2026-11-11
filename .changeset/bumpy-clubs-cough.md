@@ -6,7 +6,7 @@ Fixed evented workflows running a step once per instance when several instances 
 
 **Restarting a run another instance is running**
 
-`restart()` on an evented run now throws `WORKFLOW_RESTART_RUN_OWNED` while an instance is starting the run or running one of its steps, including a step of a nested workflow. It keeps throwing until the run's lease expires, `MASTRA_AGENT_THREAD_LEASE_TTL_MS` (15 seconds by default) after the run's last step. The boot-time restart skips such a run, and the recovery loop restarts it once the lease expires. The error carries the expiry time in `details.leaseExpiresAt`:
+`restart()` on an evented run now throws `WORKFLOW_RESTART_RUN_OWNED` while an instance is starting the run or running one of its steps, including a step of a nested workflow. It keeps throwing until the run's lease expires, `MASTRA_AGENT_THREAD_LEASE_TTL_MS` (15 seconds by default) after the run's last step. The boot-time restart skips such a run, and the recovery loop restarts it once it finds the run orphaned: as soon as the leases expire when the instance stopped in the middle of a step, otherwise once the run went `recovery.workflowStallThresholdMs` without a write. The error carries the expiry time in `details.leaseExpiresAt`:
 
 ```ts
 import { MastraError } from '@mastra/core/error';
