@@ -9,44 +9,14 @@ import type { RunOwnershipRecord } from '../../../storage/run-fencing';
 import { WORKFLOW_RUN_LEASE_TTL_MS } from '../../run-ownership';
 import type { WorkflowRunOwnership } from '../../run-ownership';
 import type { WorkflowRunState } from '../../types';
-import { isQueuedForeachIteration } from '../workflow-event-processor/loop';
 import { forEachBounded } from './bounded';
 import { holdRestartLease } from './held-leases';
 import { restartLeaseKey, runLivenessKey } from './keys';
 import type { LivenessScope } from './liveness';
+import { MAX_NESTED_RUN_DEPTH, runningNestedRunIds } from './recovery-state';
 
 // Reads one restart check sends at once while it walks a run's nested runs.
 const NESTED_RUN_READ_CONCURRENCY = 8;
-
-// Nested workflows nest a few levels at most; the bound only stops a corrupt snapshot from looping.
-const MAX_NESTED_RUN_DEPTH = 16;
-
-/**
- * The nested runs a running step result still drives: its own nested run, or
- * the nested runs of the foreach items that have not finished.
- */
-function runningNestedRunIds(result: { status?: unknown; metadata?: unknown; output?: unknown } | undefined): string[] {
-  if (result?.status !== 'running') {
-    return [];
-  }
-
-  const metadata = result.metadata as
-    | { nestedRunId?: string; foreachNestedRunIds?: Record<string, string> }
-    | undefined;
-  const items = metadata?.foreachNestedRunIds;
-  if (!items) {
-    return metadata?.nestedRunId ? [metadata.nestedRunId] : [];
-  }
-
-  // A foreach item whose output slot is filled finished; an empty or queued slot still runs.
-  const output = result.output;
-  return Object.entries(items)
-    .filter(([index]) => {
-      const slot = Array.isArray(output) ? output[Number(index)] : undefined;
-      return slot === null || slot === undefined || isQueuedForeachIteration(slot);
-    })
-    .map(([, nestedRunId]) => nestedRunId);
-}
 
 /**
  * The liveness lease of the run, or of a nested run one of its running steps

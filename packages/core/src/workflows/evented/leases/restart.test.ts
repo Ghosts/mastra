@@ -25,6 +25,7 @@ import {
   restartOutcome,
   runIsLive,
   runStatus,
+  scanning,
   shapes,
   sleep,
   startReplica,
@@ -61,12 +62,14 @@ describe('evented restart refusal (#28712)', () => {
     }
 
     const booting = await Promise.all(
-      ['B', 'C', 'D'].map(name => startReplica(storage, shapes.step.build(tracked.reporter(name)))),
+      ['B', 'C', 'D'].map(name =>
+        startReplica(storage, shapes.step.build(tracked.reporter(name)), { recovery: scanning }),
+      ),
     );
     await Promise.all(booting.map(replica => replica.mastra.restartAllActiveWorkflowRuns()));
     expect(tracked.executions).toEqual(['A:a']);
 
-    // The sweeps re-check once the leases could have lapsed, and one of them recovers the run.
+    // The replicas' recovery loops find the run orphaned once the leases lapse, and one of them recovers it.
     await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 15_000 });
     const recovered = tracked.executions.filter(e => !e.startsWith('A:'));
     expect(recovered).toHaveLength(1);
@@ -91,8 +94,10 @@ describe('evented restart refusal (#28712)', () => {
         runLivenessKey(run.runId),
       ]);
 
-      const b = await startReplica(storage, shape.build(tracked.reporter('B')));
-      const c = await startReplica(storage, shape.build(tracked.reporter('C')));
+      // Without recovery loops, so the two restart() calls below are the only restarts.
+      const recovery = { workflows: 'off' } as const;
+      const b = await startReplica(storage, shape.build(tracked.reporter('B')), { recovery });
+      const c = await startReplica(storage, shape.build(tracked.reporter('C')), { recovery });
       const restarts = await Promise.all([restartOutcome(b, run.runId), restartOutcome(c, run.runId)]);
 
       expect(restarts.map(r => r.id).sort()).toEqual(['WORKFLOW_RESTART_RUN_OWNED', 'resolved:success']);
@@ -108,20 +113,20 @@ describe('evented restart refusal (#28712)', () => {
       const storage = new InMemoryStore();
       const tracked = track({ blocks: ['a'] });
       const a = await startReplica(storage, shapes.step.build(tracked.reporter('A')));
-      const b = await startReplica(storage, shapes.step.build(tracked.reporter('B')));
-      const c = await startReplica(storage, shapes.step.build(tracked.reporter('C')));
+      const b = await startReplica(storage, shapes.step.build(tracked.reporter('B')), { recovery: scanning });
+      const c = await startReplica(storage, shapes.step.build(tracked.reporter('C')), { recovery: scanning });
       const run = await a.workflow.createRun();
       if (method === 'start') void run.start({ inputData: { n: 1 } });
       else await run.startAsync({ inputData: { n: 1 } });
       await tracked.allBlocked;
       const blockedSince = Date.now();
 
-      // Both sweeps are refused, then re-check the run once the liveness they saw could have
-      // lapsed. A keeps it fresh, so at least one re-check is refused as well.
+      // Both sweeps skip the run, and so do the recovery loops ticking on while A keeps the run
+      // live for longer than the liveness TTL.
       const leases = await recordLeases(storage);
       await Promise.all([b.mastra.restartAllActiveWorkflowRuns(), c.mastra.restartAllActiveWorkflowRuns()]);
-      await leases.until(() => leases.reads.filter(key => key === runLivenessKey(run.runId)).length >= 3);
       await sleep(Math.max(0, blockedSince + WORKFLOW_RUN_LEASE_TTL_MS * 2 - Date.now()));
+      await leases.until(() => leases.reads.filter(key => key === runLivenessKey(run.runId)).length >= 6);
 
       tracked.release();
       await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'));

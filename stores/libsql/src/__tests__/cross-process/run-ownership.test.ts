@@ -35,7 +35,12 @@ describe('workflow run ownership across processes on a shared LibSQL file', () =
     const workflow = createOwnedWorkflow(async runId => {
       executedByB.push(runId);
     });
-    replicaB = new Mastra({ logger: false, storage, workflows: { workflow } });
+    replicaB = new Mastra({
+      logger: false,
+      storage,
+      workflows: { workflow },
+      recovery: { workflowScanIntervalMs: 200 },
+    });
   });
 
   afterEach(async () => {
@@ -115,11 +120,12 @@ describe('workflow run ownership across processes on a shared LibSQL file', () =
     async () => {
       const { peer, runId } = await startReplicaA();
 
+      await replicaB.startWorkers();
       await replicaB.restartAllActiveWorkflowRuns();
       expect(executedByB).toEqual([]);
 
       await peer.kill();
-      // The sweep re-checks after the lease expiry plus up to 5s jitter, then restarts the run.
+      // B's recovery loop finds the run orphaned once the lease expires, then restarts it.
       await expect.poll(() => executedByB, { timeout: DEFAULT_HANG_GUARD_MS }).toEqual([runId]);
       await expect.poll(() => status(runId), { timeout: DEFAULT_HANG_GUARD_MS }).toBe('success');
     },

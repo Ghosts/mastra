@@ -35,7 +35,7 @@ async function persistActiveRun(storage: MockStore, workflowName: string, runId:
 async function stubActiveRun(storage: MockStore, workflow: Workflow<any, any, any, any, any, any>, runId: string) {
   await persistActiveRun(storage, workflow.id, runId);
   const restart = vi.fn().mockResolvedValue(undefined);
-  const createRun = vi.spyOn(workflow, 'createRun').mockResolvedValue({ restart } as any);
+  const createRun = vi.spyOn(workflow, 'createRun').mockResolvedValue({ workflowRunStatus: 'running', restart } as any);
   return { createRun, restart };
 }
 
@@ -135,6 +135,7 @@ describe('Mastra.restartAllActiveWorkflowRuns', () => {
     const restarted: string[] = [];
     vi.spyOn(workflow, 'createRun').mockImplementation(async ({ runId } = {}) => {
       return {
+        workflowRunStatus: 'running',
         restart: async () => {
           if (runId === 'run-0') {
             throw new Error('boom');
@@ -273,10 +274,25 @@ describe('Mastra.restartAllActiveWorkflowRuns', () => {
     expect(new Mastra({ logger: false }).recoveryConfig).toEqual({
       workflows: 'auto',
       workflowConcurrency: 5,
+      workflowScanIntervalMs: 30_000,
+      workflowStallThresholdMs: 300_000,
       durableAgents: 'off',
     });
     expect(
-      new Mastra({ logger: false, recovery: { workflows: 'off', workflowConcurrency: 0 } }).recoveryConfig,
-    ).toMatchObject({ workflows: 'off', workflowConcurrency: 1 });
+      new Mastra({
+        logger: false,
+        recovery: {
+          workflows: 'off',
+          workflowConcurrency: 0,
+          workflowScanIntervalMs: -1,
+          workflowStallThresholdMs: NaN,
+        },
+      }).recoveryConfig,
+    ).toMatchObject({
+      workflows: 'off',
+      workflowConcurrency: 1,
+      workflowScanIntervalMs: 30_000,
+      workflowStallThresholdMs: 300_000,
+    });
   });
 });

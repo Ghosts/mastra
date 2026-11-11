@@ -9,6 +9,7 @@ import { EventEmitterPubSub } from '../../../events/event-emitter';
 import type { PubSub } from '../../../events/pubsub';
 import type { Event } from '../../../events/types';
 import { Mastra } from '../../../mastra';
+import type { MastraRecoveryConfig } from '../../../mastra';
 import type { InMemoryStore } from '../../../storage/mock';
 import { runLivenessKey } from '../leases';
 import { abandonLease } from './abandon-lease';
@@ -130,13 +131,26 @@ export async function stopReplicas() {
   await Promise.all(replicas.splice(0).map(mastra => mastra.shutdown({ drainTimeout: 0 })));
 }
 
+/** Recovery loop settings that let a tick find an orphaned run within a test. */
+export const scanning = { workflowScanIntervalMs: 100 };
+
 /** Starts a replica running `workflow` (registered as `leased`) and any nested workflows it calls. */
 export async function startReplica<W extends Built>(
   storage: Store,
   workflow: W,
-  { pubsub = new EventEmitterPubSub() as PubSub, nested = {} as Record<string, Built> } = {},
+  {
+    pubsub = new EventEmitterPubSub() as PubSub,
+    nested = {} as Record<string, Built>,
+    recovery = undefined as MastraRecoveryConfig | undefined,
+  } = {},
 ) {
-  const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { leased: workflow, ...nested } as any });
+  const mastra = new Mastra({
+    logger: false,
+    storage,
+    pubsub,
+    recovery,
+    workflows: { leased: workflow, ...nested } as any,
+  });
   await mastra.startWorkers();
   replicas.push(mastra);
   return { mastra, pubsub, workflow };
@@ -194,6 +208,7 @@ export async function recordLeases(storage: Store) {
   const store = (await storage.getStore('workflows'))!;
   const claim = store.claimRunOwnership.bind(store);
   const read = store.getRunOwnership.bind(store);
+  const readMany = store.getRunOwnerships.bind(store);
   const claims: { key: string; acquired: boolean }[] = [];
   const reads: string[] = [];
   let notify = () => {};
@@ -207,6 +222,12 @@ export async function recordLeases(storage: Store) {
   vi.spyOn(store, 'getRunOwnership').mockImplementation(async args => {
     const result = await read(args);
     reads.push(args.runId);
+    notify();
+    return result;
+  });
+  vi.spyOn(store, 'getRunOwnerships').mockImplementation(async args => {
+    const result = await readMany(args);
+    reads.push(...args.runIds);
     notify();
     return result;
   });

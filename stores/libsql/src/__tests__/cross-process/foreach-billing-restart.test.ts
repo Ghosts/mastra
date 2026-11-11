@@ -66,11 +66,19 @@ describe('restarting a foreach after its process was SIGKILLed mid-billing (#262
       const workflow = createBillingWorkflow(concurrency, async customer => {
         writeFileSync(logPath, `B ${customer}\n`, { flag: 'a' });
       });
-      replicaB = new Mastra({ logger: false, storage, workflows: { workflow } });
+      replicaB = new Mastra({
+        logger: false,
+        storage,
+        workflows: { workflow },
+        recovery: { workflowScanIntervalMs: 200 },
+      });
       const { runs } = await replicaB.listActiveWorkflowRuns();
       expect(runs, env.describe()).toHaveLength(1);
       const { runId, workflowName } = runs[0]!;
 
+      // Boots like a deployed server. A's lease may not have lapsed yet; B's recovery loop then
+      // restarts the run once it does.
+      await replicaB.startWorkers();
       await replicaB.restartAllActiveWorkflowRuns();
       const workflows = (await storage.getStore('workflows'))!;
       await expect

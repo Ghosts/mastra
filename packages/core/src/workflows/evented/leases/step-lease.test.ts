@@ -31,6 +31,7 @@ import {
   recordLeases,
   replicas,
   runStatus,
+  scanning,
   shapes,
   sleep,
   startReplica,
@@ -336,7 +337,7 @@ describe('evented step leases (#28712)', () => {
     const storage = new InMemoryStore();
     const tracked = track({ blocks: ['a'] }, { hangForever: true });
     const a = await startReplica(storage, shapes.step.build(tracked.reporter('A')));
-    const b = await startReplica(storage, shapes.step.build(tracked.reporter('B')));
+    const b = await startReplica(storage, shapes.step.build(tracked.reporter('B')), { recovery: scanning });
     let delivery: Event | undefined;
     await a.pubsub.subscribe('workflows', event => {
       if (event.type === 'workflow.step.run') delivery = structuredClone(event);
@@ -346,7 +347,7 @@ describe('evented step leases (#28712)', () => {
     await tracked.allBlocked;
     expect(await b.mastra.handleWorkflowEvent({ ...delivery!, deliveryAttempt: 10 })).toEqual({ ok: true });
 
-    // The dropped delivery can no longer bring the step back, so B re-checks the run itself.
+    // The dropped delivery can no longer bring the step back; B's recovery loop restarts the run.
     await crash(a, storage, [stepOccurrenceKey(run.runId, [0]), runLivenessKey(run.runId)]);
 
     await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 15_000 });
@@ -359,8 +360,6 @@ describe('evented step leases (#28712)', () => {
   ] as const)(
     '%s whose nested step dropped an exhausted delivery before its replica crashed',
     async (_, restartable) => {
-      // Re-checks fire right at the lease expiry, so a re-check that would happen does so within the wait below.
-      vi.spyOn(Math, 'random').mockReturnValue(0);
       const storage = new InMemoryStore();
       const executions: string[] = [];
       const build = (replica: string) => {
@@ -391,7 +390,7 @@ describe('evented step leases (#28712)', () => {
       const onA = build('A');
       const onB = build('B');
       const a = await startReplica(storage, onA.parent, { nested: { child: onA.child } });
-      const b = await startReplica(storage, onB.parent, { nested: { child: onB.child } });
+      const b = await startReplica(storage, onB.parent, { nested: { child: onB.child }, recovery: scanning });
       let delivery: Event | undefined;
       await a.pubsub.subscribe('workflows', event => {
         // A nested event carries its parent's step graph; the broker delivers it serialized.
