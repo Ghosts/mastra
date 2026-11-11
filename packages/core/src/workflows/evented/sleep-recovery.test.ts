@@ -326,23 +326,26 @@ describe('recovery of evented runs in a sleep (#30012)', () => {
     20_000,
   );
 
-  it('restartAllActiveWorkflowRuns() on an instance without the recovery loop wakes a sleep whose replica stopped once it is due', async () => {
-    const storage = new InMemoryStore();
-    const seen = observe('leased');
-    const a = await startReplica(storage, sleepingFor(500)(seen.reporter('A')));
-    const b = await startReplica(storage, sleepingFor(500)(seen.reporter('B')), { recovery: { workflows: 'off' } });
-    const run = await a.workflow.createRun();
-    startInBackground(run, { n: 1 });
-    await sleepingRunId(storage, run.runId);
-    await crash(a, storage, [runLivenessKey(run.runId)]);
+  it.each(['orphaned', 'all'] as const)(
+    "restartAllActiveWorkflowRuns({ mode: '%s' }) on an instance without the recovery loop wakes a sleep whose replica stopped once it is due",
+    async mode => {
+      const storage = new InMemoryStore();
+      const seen = observe('leased');
+      const a = await startReplica(storage, sleepingFor(500)(seen.reporter('A')));
+      const b = await startReplica(storage, sleepingFor(500)(seen.reporter('B')), { recovery: { workflows: 'off' } });
+      const run = await a.workflow.createRun();
+      startInBackground(run, { n: 1 });
+      await sleepingRunId(storage, run.runId);
+      await crash(a, storage, [runLivenessKey(run.runId)]);
 
-    // Nothing checks the run again later, so these calls must not leave it to an overdue check.
-    await b.mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
-    await b.mastra.restartAllActiveWorkflowRuns({ mode: 'all' });
+      // Nothing checks the run again later, so this one call must not leave it to an overdue check.
+      await b.mastra.restartAllActiveWorkflowRuns({ mode });
 
-    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 4_000 });
-    expect(seen.executions).toEqual(['A:before', 'B:after']);
-    // The restart still waited until the sleep was due.
-    expect(seen.at['B:after']).toBeGreaterThanOrEqual(seen.at['A:before']! + 500);
-  }, 20_000);
+      await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 4_000 });
+      expect(seen.executions).toEqual(['A:before', 'B:after']);
+      // The restart still waited until the sleep was due.
+      expect(seen.at['B:after']).toBeGreaterThanOrEqual(seen.at['A:before']! + 500);
+    },
+    20_000,
+  );
 });
