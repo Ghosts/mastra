@@ -15,7 +15,10 @@ vi.hoisted(() => {
 });
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod/v4';
 import { EventEmitterPubSub } from '../../events/event-emitter';
+import type { PubSub } from '../../events/pubsub';
+import type { Event } from '../../events/types';
 import type { MastraRecoveryConfig } from '../../mastra';
 import { InMemoryStore } from '../../storage/mock';
 import { runLivenessKey, SLEEP_WAKE_GRACE_MS } from './leases';
@@ -40,7 +43,7 @@ import {
   work,
 } from './test-utils/lease-replicas';
 import type { Built, Report } from './test-utils/lease-replicas';
-import { createWorkflow } from '.';
+import { createStep, createWorkflow } from '.';
 
 afterEach(stopReplicas);
 
@@ -116,6 +119,61 @@ describe('recovery of evented runs in a sleep (#30012)', () => {
     },
     20_000,
   );
+
+  it('keeps the state a sleep duration function set when another replica wakes the run', async () => {
+    const storage = new InMemoryStore();
+    const seen: Record<string, unknown> = {};
+    const build = () =>
+      createWorkflow({
+        id: 'leased',
+        inputSchema: Num,
+        outputSchema: z.any(),
+        stateSchema: z.object({ scheduled: z.boolean().optional() }),
+      })
+        .then(work('before', async () => {}))
+        .sleep(async ({ setState }) => {
+          await setState({ scheduled: true });
+          return 300;
+        })
+        .then(
+          createStep({
+            id: 'after',
+            inputSchema: z.any(),
+            outputSchema: z.any(),
+            stateSchema: z.object({ scheduled: z.boolean().optional() }),
+            execute: async ({ inputData, state }) => {
+              seen.state = state;
+              return inputData;
+            },
+          }),
+        )
+        .commit() as unknown as Built;
+    // Each delivery gets its own copy of the event, as from a broker. An in-process pubsub hands on
+    // the objects the in-memory store keeps, so a state change there would reach the store unwritten.
+    const brokered = () =>
+      new Proxy(new EventEmitterPubSub(), {
+        get(target, prop) {
+          if (prop === 'publish') {
+            return (topic: string, event: Event, options?: { localOnly?: boolean }) =>
+              target.publish(topic, JSON.parse(JSON.stringify(event)), options);
+          }
+
+          const value = Reflect.get(target, prop, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }) as PubSub;
+    const a = await startReplica(storage, build(), { pubsub: brokered() });
+    await startReplica(storage, build(), { pubsub: brokered(), recovery: scanning });
+    const run = await a.workflow.createRun();
+    startInBackground(run, { n: 1 });
+    await sleepingRunId(storage, run.runId);
+
+    // The duration function ran on A only; B resumes the stored sleep without calling it again.
+    await crash(a, storage, [runLivenessKey(run.runId)]);
+
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 10_000 });
+    expect(seen.state).toMatchObject({ scheduled: true });
+  }, 20_000);
 
   it('leaves a sleep stored without a wake time to the timer that started it', async () => {
     const storage = new InMemoryStore();

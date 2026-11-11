@@ -326,10 +326,20 @@ async function setUpSleep(
 
   // Only a fresh sleep resolves its duration: a resumed one waits for the rest of the stored wait.
   let wakeAt = resumed?.wakeAt;
+  // The state a duration function changed with `setState()`, stored with the sleep: a resumed sleep
+  // doesn't call the function again, so the next step would otherwise get the state from before it.
+  let changedState: Record<string, any> | undefined;
   if (wakeAt === undefined) {
+    // resolveDuration's `setState()` changes `stepResults.__state` in place.
+    const state = args.stepResults?.__state as Record<string, any> | undefined;
+    const stateBefore = JSON.stringify(state);
     // Create a proper RequestContext from the plain object passed in ProcessorArgs
     const duration = await resolveDuration(new RequestContext(Object.entries(requestContext ?? {}) as any));
     wakeAt = Date.now() + (Number.isFinite(duration) ? Math.max(0, duration) : 0);
+    // Only a change is written: a parallel branch may have stored newer state than this delivery's copy.
+    if (JSON.stringify(state) !== stateBefore) {
+      changedState = state;
+    }
   }
 
   await workflowsStore?.updateWorkflowResults({
@@ -338,6 +348,7 @@ async function setUpSleep(
     stepId,
     result: { status: 'waiting', payload, startedAt, metadata: { wakeAt } },
     requestContext: withoutAuthToken(requestContext ?? {}),
+    state: changedState,
   });
   await workflowsStore?.updateWorkflowState({
     workflowName: workflowId,
