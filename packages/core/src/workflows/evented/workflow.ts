@@ -2020,6 +2020,7 @@ export class EventedRun<
       store: await this.mastra?.getStorage()?.getStore('workflows'),
       runId: this.runId,
       snapshot,
+      logger: this.mastra?.getLogger(),
     });
   }
 
