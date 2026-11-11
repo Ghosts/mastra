@@ -4600,7 +4600,13 @@ export class Mastra<
             return restarts;
           }
 
-          const recoverable = await this.#recoverableRuns(page, workflowsStore, parentStatusOf, evented);
+          const recoverable = await this.#recoverableRuns(
+            page,
+            workflowsStore,
+            parentStatusOf,
+            evented,
+            readsOwnership,
+          );
           // A run this process is already restarting needs no read; the call still waits for it.
           // Only an `all` pass drops the check a queued run gets when it reaches its slot.
           const runs = recoverable.filter(run => {
@@ -5066,13 +5072,15 @@ export class Mastra<
   /**
    * The runs of one batch a recovery pass should consider. A nested run is left out when its
    * parent still drives it, and canceled when its parent already finished, unless the nested run
-   * of an `evented` workflow is still live: a worker may be finishing it.
+   * of an `evented` workflow is still live: a worker may be finishing it. Liveness is read only
+   * when `readsOwnership` says the store supports run fencing.
    */
   async #recoverableRuns(
     page: WorkflowRuns['runs'],
     workflowsStore: WorkflowsStorage,
     parentStatusOf: ReturnType<typeof createNestedRunParentStatusLookup>,
     evented: boolean,
+    readsOwnership: boolean,
   ): Promise<WorkflowRuns['runs']> {
     const runs: WorkflowRuns['runs'] = [];
     for (const run of page) {
@@ -5092,7 +5100,12 @@ export class Mastra<
           runs.push(run);
         } else if (recovery === 'cancel') {
           // An evented nested run holds no run lease; its liveness key tells whether a worker runs it.
-          if (evented && (await workflowsStore.getRunOwnership({ runId: runLivenessKey(run.runId) }))?.live) {
+          // A store without run fencing writes no liveness keys, and its ownership reads throw.
+          const live =
+            evented &&
+            readsOwnership &&
+            (await workflowsStore.getRunOwnership({ runId: runLivenessKey(run.runId) }))?.live;
+          if (live) {
             continue;
           }
 

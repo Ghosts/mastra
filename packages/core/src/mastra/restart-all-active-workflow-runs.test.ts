@@ -19,6 +19,7 @@ import { MockStore } from '../storage/mock';
 import { createEmptyWorkflowSnapshot } from '../storage/workflow-snapshot';
 import { createWorkflow } from '../workflows';
 import type { Workflow } from '../workflows';
+import { createWorkflow as createEventedWorkflow } from '../workflows/evented';
 import { Mastra } from './index';
 
 /** Stores a `running` run of `workflowName`, as a process that crashed mid-run leaves it. */
@@ -291,6 +292,40 @@ describe('Mastra.restartAllActiveWorkflowRuns', () => {
     await mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
     const unparseable = warn.mock.calls.filter(([message]) => String(message).includes('stored state'));
     expect(unparseable).toHaveLength(1);
+  });
+
+  it('cancels an evented nested run whose parent finished on a store without run ownership support', async () => {
+    const child = createEventedWorkflow({
+      id: 'child',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    }).commit();
+    const storage = new MockStore();
+    const workflows = (await storage.getStore('workflows'))!;
+    // The base store's ownership methods throw, as on an adapter without run fencing.
+    vi.spyOn(workflows, 'supportsRunFencing').mockReturnValue(false);
+    vi.spyOn(workflows, 'getRunOwnership').mockRejectedValue(new Error('run fencing is not supported'));
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'outer',
+      runId: 'parent',
+      snapshot: { ...createEmptyWorkflowSnapshot('parent'), status: 'success' },
+    });
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'child',
+      runId: 'left-behind',
+      snapshot: {
+        ...createEmptyWorkflowSnapshot('left-behind'),
+        status: 'running',
+        parentWorkflow: { workflowId: 'outer', runId: 'parent' },
+      } as any,
+    });
+    const mastra = new Mastra({ logger: false, storage, workflows: { child } });
+
+    await mastra.restartAllActiveWorkflowRuns({ mode: 'all' });
+
+    expect((await workflows.loadWorkflowSnapshot({ workflowName: 'child', runId: 'left-behind' }))?.status).toBe(
+      'canceled',
+    );
   });
 
   it('falls back to the recovery defaults for invalid values', () => {
