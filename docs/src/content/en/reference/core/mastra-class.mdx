@@ -391,9 +391,10 @@ Visit the [Configuration reference](/reference/configuration) for detailed docum
     name: 'recovery',
     type: 'MastraRecoveryConfig',
     description:
-      'Boot-time recovery behavior for orphaned agent and workflow runs. See [Crash recovery](/docs/harness/durable-agents#crash-recovery).',
+      'Recovery behavior for orphaned agent and workflow runs. See [Crash recovery](/docs/harness/durable-agents#crash-recovery) and [restarting active workflow runs](/docs/workflows/overview#restarting-active-workflow-runs).',
     isOptional: true,
-    defaultValue: "{ durableAgents: 'off', workflows: 'auto', workflowConcurrency: 5 }",
+    defaultValue:
+      "{ durableAgents: 'off', workflows: 'auto', workflowConcurrency: 5, workflowScanIntervalMs: 30000, workflowStallThresholdMs: 300000 }",
     properties: [
       {
         type: 'object',
@@ -412,7 +413,7 @@ Visit the [Configuration reference](/reference/configuration) for detailed docum
             isOptional: true,
             defaultValue: "'auto'",
             description:
-              "Set to `'off'` to skip restarting active workflow runs on server boot. Individual workflows can also opt out with `autoRestartActiveRuns: false`.",
+              "Set to `'off'` to skip restarting active workflow runs on server boot and to run no workflow recovery loop. Individual workflows can also opt out with `autoRestartActiveRuns: false`.",
           },
           {
             name: 'workflowConcurrency',
@@ -420,7 +421,23 @@ Visit the [Configuration reference](/reference/configuration) for detailed docum
             isOptional: true,
             defaultValue: '5',
             description:
-              'Maximum number of workflow runs restarted at the same time during boot recovery. Use `Infinity` for no limit. A default-engine run holds its slot until it finishes. An evented run holds it until a worker starts the run, for at most `MASTRA_AGENT_THREAD_LEASE_TTL_MS` (15 seconds by default). Workflow and durable agent recovery run in parallel.',
+              'Maximum number of workflow runs restarted at the same time by boot recovery and the recovery loop. Use `Infinity` for no limit. A default-engine run counts until it finishes, an evented run until a worker starts it, or `MASTRA_AGENT_THREAD_LEASE_TTL_MS` (15 seconds by default) after its restart was published. Workflow and durable agent recovery run in parallel.',
+          },
+          {
+            name: 'workflowScanIntervalMs',
+            type: 'number',
+            isOptional: true,
+            defaultValue: '30000',
+            description:
+              'How often, in milliseconds, an instance that runs workers checks storage for workflow runs whose process stopped. The first check runs when workers start. Each later check runs up to 20% earlier or later, so instances started together check at different times. Only storage adapters with run-ownership support run the repeated checks.',
+          },
+          {
+            name: 'workflowStallThresholdMs',
+            type: 'number',
+            isOptional: true,
+            defaultValue: '300000',
+            description:
+              'How long, in milliseconds, an active workflow run can go without a storage write and without a process keeping it alive before the recovery loop restarts it. This recovers a run whose next step message was lost.',
           },
         ],
       },
