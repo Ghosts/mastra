@@ -111,6 +111,7 @@ const pausedScopes = new WeakSet<LivenessScope>();
 /** The leases of the wakes each process is running. */
 const activeWakes = new WeakMap<LivenessScope, Set<SleepWakeLease>>();
 
+// Longer timer delays overflow and fire at once, so a longer sleep is timed in chunks of this.
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 const FINISHED_RUN_STATUSES = new Set(['success', 'failed', 'canceled', 'tripwire', 'bailed']);
@@ -122,22 +123,25 @@ const samePath = (a: number[] | undefined, b: number[]) =>
  * Stops the wakes of the sleeps `scope` started or resumed. Called when its
  * workers stop, before their consumers go, since an event published from then
  * on might reach no worker.
+ *
  * Pending wake timers are cleared and kept for {@link resumeSleepWakes}. A
- * wake already running stops renewing its lease, so another process can wake
- * the sleep once the lease lapses, and stops before writing or publishing
- * unless it already published; once stopped, it lets its lease lapse and is
- * kept the same way. The sleeps stay `waiting`: a restart resumes
- * them, and the recovery loop of an instance still running wakes them once
- * they are overdue. A sleep set up or a wake lease claimed until the workers
- * start again, by work the drain gave up on, is put aside or abandoned the
- * same way.
+ * wake already running stops renewing its lease and stops before it writes or
+ * publishes, unless it already published; once stopped, it lets its lease
+ * lapse and is kept the same way. A sleep that work the drain gave up on sets
+ * up later is kept too. The sleeps stay `waiting`: the workers starting again
+ * wake them, and so does the recovery loop of another instance once they are
+ * overdue.
  */
 export function pauseSleepWakes(scope: LivenessScope): void {
   pausedScopes.add(scope);
+
   const pending = [...(pendingWakes.get(scope) ?? [])];
   pendingWakes.delete(scope);
   pending.forEach(wake => clearTimeout(wake.timer));
-  if (pending.length > 0) pausedWakes.set(scope, [...(pausedWakes.get(scope) ?? []), ...pending]);
+  if (pending.length > 0) {
+    pausedWakes.set(scope, [...(pausedWakes.get(scope) ?? []), ...pending]);
+  }
+
   activeWakes.get(scope)?.forEach(lease => lease.abandon());
 }
 
@@ -148,6 +152,7 @@ export function pauseSleepWakes(scope: LivenessScope): void {
  */
 export function resumeSleepWakes(scope: LivenessScope): void {
   pausedScopes.delete(scope);
+
   const paused = pausedWakes.get(scope) ?? [];
   pausedWakes.delete(scope);
   paused.forEach(wake => scheduleWake(wake.args, wake.deps, wake.occurrence));
@@ -203,10 +208,11 @@ export async function processWorkflowSleepUntil(
  *
  * A delivery that arrives after the run left the sleep (it finished, moved
  * past the sleep, or the sleep was woken and the next step is on its way) is
- * dropped; see {@link leftSleep} for what counts under time travel.
+ * dropped; see {@link leftSleep} for what counts under time travel. One that
+ * finds the occurrence it read already woken only marks it finished.
  *
  * With step leases, deliveries of the sleep's event set it up one at a time
- * (see {@link claimSleepStart}): one that finds another delivery doing so is
+ * (see `claimSleepStart`): one that finds another delivery doing so is
  * dropped, and the stored run is read only once the lease is held.
  */
 async function startSleep(
@@ -218,6 +224,8 @@ async function startSleep(
   const start = deps.leaseStore
     ? await claimSleepStart({ store: deps.leaseStore, key: sleepStartKey(runId, executionPath), logger: deps.logger })
     : undefined;
+  // The delivery holding the lease sets the occurrence up, and its broker redelivers its event if
+  // its process stops first.
   if (start === null) {
     deps.logger?.debug('Dropping a delivery of a sleep another delivery is starting', {
       workflowId,
@@ -226,6 +234,7 @@ async function startSleep(
     });
     return;
   }
+
   try {
     await setUpSleep(args, deps, resolveDuration);
   } finally {
@@ -244,6 +253,7 @@ async function setUpSleep(
   // Step-lifecycle watch events honor `emitStepEvents: false` (#21529). The
   // `workflows` routing publish in wakeSleep is never gated: it drives execution.
   const emitStepEvents = workflow.options.emitStepEvents !== false;
+
   const snapshot = await workflowsStore?.loadWorkflowSnapshot({ workflowName: workflowId, runId });
   const resumed = snapshot && !timeTravel ? sleepInProgress(snapshot, executionPath, step.id) : undefined;
   // Once the next step moved the run on, only the delivery's own copy of the run shows the sleep.
@@ -285,6 +295,7 @@ async function setUpSleep(
     return;
   }
 
+  // A resumed sleep keeps the id, input and start time it was stored with.
   const stepId = resumed?.stepId ?? step.id;
   const payload = resumed ? resumed.payload : prevResult.status === 'success' ? prevResult.output : undefined;
   const startedAt = resumed?.startedAt ?? Date.now();
@@ -300,6 +311,7 @@ async function setUpSleep(
     });
   }
 
+  // Only a fresh sleep resolves its duration: a resumed one waits for the rest of the stored wait.
   let wakeAt = resumed?.wakeAt;
   if (wakeAt === undefined) {
     // Create a proper RequestContext from the plain object passed in ProcessorArgs
@@ -337,16 +349,25 @@ async function setUpSleep(
  * process are stopped.
  */
 function scheduleWake(args: ProcessorArgs, deps: SleepDeps, occurrence: SleepOccurrence) {
+  // A timer set now could publish to workers that stopped; resumeSleepWakes sets it.
   if (pausedScopes.has(deps.scope)) {
     pausedWakes.set(deps.scope, [...(pausedWakes.get(deps.scope) ?? []), { args, deps, occurrence }]);
     return;
   }
+
   let pending = pendingWakes.get(deps.scope);
-  if (!pending) pendingWakes.set(deps.scope, (pending = new Set()));
-  const wake: PendingWake = { args, deps, occurrence, timer: undefined! };
+  if (!pending) {
+    pending = new Set();
+    pendingWakes.set(deps.scope, pending);
+  }
+
+  // One timer per wake, not a repeating one: a timer capped below the wake time fires early, and
+  // wakeSleep then calls this again for the rest of the wait.
+  const wake: PendingWake = { args, deps, occurrence };
   wake.timer = setTimeout(
     () => {
       pending.delete(wake);
+      // wakeSleep logs its own expected outcomes; a rejection is an unexpected store or pubsub failure.
       void wakeSleep(args, deps, occurrence).catch(error =>
         deps.logger?.error('Failed to wake a sleeping workflow run', {
           workflowId: args.workflowId,
@@ -356,7 +377,6 @@ function scheduleWake(args: ProcessorArgs, deps: SleepDeps, occurrence: SleepOcc
         }),
       );
     },
-    // A longer delay overflows and fires at once; wakeSleep sets the timer again until the wake time.
     Math.min(Math.max(0, occurrence.wakeAt - Date.now()), MAX_TIMER_DELAY_MS),
   );
   pending.add(wake);
@@ -376,10 +396,25 @@ function scheduleWake(args: ProcessorArgs, deps: SleepDeps, occurrence: SleepOcc
  * again.
  */
 function leftSleep(snapshot: WorkflowRunState, executionPath: number[], timeTravel: boolean): boolean {
-  if ((snapshot.activePaths?.[0] ?? -1) > executionPath[0]!) return true;
-  if (timeTravel) return false;
-  if (FINISHED_RUN_STATUSES.has(snapshot.status)) return true;
-  if (!samePath(snapshot.activePaths, executionPath)) return false;
+  if ((snapshot.activePaths?.[0] ?? -1) > executionPath[0]!) {
+    return true;
+  }
+
+  // The status and results may still be the travelled-from run's; only the cursor above is this run's.
+  if (timeTravel) {
+    return false;
+  }
+
+  if (FINISHED_RUN_STATUSES.has(snapshot.status)) {
+    return true;
+  }
+
+  // A run whose cursor is elsewhere, for example in another parallel branch, has not left this sleep.
+  if (!samePath(snapshot.activePaths, executionPath)) {
+    return false;
+  }
+
+  // A wake marks the sleep `success` before it publishes the next step.
   return Object.entries(snapshot.activeStepsPath ?? {}).some(
     ([stepId, path]) => samePath(path, executionPath) && snapshot.context?.[stepId]?.status === 'success',
   );
@@ -400,10 +435,14 @@ function sleepInProgress(
 ): SleepOccurrence | undefined {
   const active = snapshot.activeStepsPath ?? {};
   const ids = [stepId, ...Object.keys(active).filter(id => id !== stepId)];
+
   for (const id of ids) {
     const stored = snapshot.context?.[id];
     const wakeAt = storedWakeAt(stored);
-    if (!samePath(active[id], executionPath) || stored?.status !== 'waiting' || wakeAt === undefined) continue;
+    if (!samePath(active[id], executionPath) || stored?.status !== 'waiting' || wakeAt === undefined) {
+      continue;
+    }
+
     return { stepId: id, payload: stored.payload, startedAt: stored.startedAt, wakeAt };
   }
 }
@@ -414,62 +453,83 @@ function sleepInProgress(
  * sleep is overdue: the restart resumes the sleep in whichever process takes
  * it, and the timer it sets fires at once.
  *
- * Waking more than once is a no-op. The wake claims the occurrence's lease
- * (see {@link claimSleepWake}) and gives up while another process holds it
- * or once a wake released it. It then wakes only while the stored run is
- * still active and in this occurrence. It marks the run live and the sleep
- * `success` before publishing, so a restart is refused until the next step
- * takes its own lease, and releases the lease only once the next step was
- * published. When publishing fails, the sleep is put back to `waiting` and
- * the lease left to lapse, so an overdue check wakes it again.
+ * Waking more than once is a no-op: the wake claims the occurrence's lease
+ * (see `claimSleepWake`), and wakes only while the stored run is still active
+ * and in this occurrence. It marks the run live and the sleep `success` before
+ * publishing, so a restart is refused until the next step takes its own lease,
+ * and releases the lease only once the next step was published. When
+ * publishing fails, the sleep is put back to `waiting` and the lease left to
+ * lapse, so an overdue check wakes it again.
  *
- * Leases are advisory, so the wake checks that it still holds its lease
- * before marking the sleep `success` and again before publishing, and stops
- * (putting the sleep back to `waiting` if it already marked it) when the
- * lease lapsed or was abandoned meanwhile. A wake stalled past the lease TTL
- * between that check and the publish can still publish twice.
- *
- * A call before the wake time sets the timer again; a process shutting down
- * does not wake, and the recovery loop of another instance wakes the sleep
- * once it is overdue.
+ * Leases are advisory, so the wake checks that it still holds its lease before
+ * marking the sleep `success` and again before publishing, and stops (putting
+ * the sleep back to `waiting` if it already marked it) when the lease lapsed or
+ * was abandoned meanwhile. A wake stalled past the lease TTL between that check
+ * and the publish can still publish twice.
  */
 async function wakeSleep(args: ProcessorArgs, deps: SleepDeps, occurrence: SleepOccurrence) {
   const { workflow, workflowId, runId, executionPath, prevResult, requestContext } = args;
   const { pubsub, workflowsStore, leaseStore, scope, logger } = deps;
   const { stepId, payload, startedAt } = occurrence;
-  if (scope.__shuttingDown) return;
-  if (Date.now() < occurrence.wakeAt) return scheduleWake(args, deps, occurrence);
+
+  // A process shutting down publishes to workers that are going away; the recovery loop of
+  // another instance wakes the sleep once it is overdue.
+  if (scope.__shuttingDown) {
+    return;
+  }
+
+  // A timer capped below a long wake time fires early.
+  if (Date.now() < occurrence.wakeAt) {
+    return scheduleWake(args, deps, occurrence);
+  }
+
   const key = sleepOccurrenceKey(runId, executionPath, startedAt);
   const lease = leaseStore ? await claimSleepWake({ store: leaseStore, key, logger }) : undefined;
   if (lease === 'busy') {
     logger?.debug('Another process is waking this workflow sleep', { workflowId, runId, stepId });
     return;
   }
+
+  // The stored result may show `waiting` again although that wake published the next step.
   if (lease === 'woken') {
     logger?.debug('This workflow sleep was already woken', { workflowId, runId, stepId });
     return markWokenSleepFinished(args, deps, occurrence);
   }
-  // Stopping the workers abandons it (see pauseSleepWakes).
+
+  // pauseSleepWakes abandons the leases listed here when the workers stop.
   let active = activeWakes.get(scope);
   if (lease) {
-    if (!active) activeWakes.set(scope, (active = new Set()));
+    if (!active) {
+      active = new Set();
+      activeWakes.set(scope, active);
+    }
+
     active.add(lease);
-    // The workers stopped while the claim was on its way.
-    if (pausedScopes.has(scope)) lease.abandon();
+    // The workers stopped while the claim was on its way, after pauseSleepWakes went through the list.
+    if (pausedScopes.has(scope)) {
+      lease.abandon();
+    }
   }
+
   // Set when stopping the workers stopped this wake, which then runs again once they start.
   let interrupted = false;
   // A lease that lapsed while this wake waited on the store may already be another wake's.
   const lost = async () => {
-    if (!lease || (await lease.held())) return false;
+    if (!lease || (await lease.held())) {
+      return false;
+    }
+
     interrupted = pausedScopes.has(scope);
     logger?.debug('Lost the lease of a workflow sleep while waking it', { workflowId, runId, stepId });
     return true;
   };
+
   let published = false;
   try {
     const snapshot = await workflowsStore?.loadWorkflowSnapshot({ workflowName: workflowId, runId });
-    // A run with no stored state has nothing to check against, and its timer wakes it.
+    // A run with no stored state has nothing to check against, and its timer wakes it. Otherwise
+    // the run must still be in this very occurrence: a restart, a time travel or a cancel since
+    // the timer was set stores a different sleep or none.
     if (snapshot) {
       const stored = snapshot.context?.[stepId];
       const sameSleep =
@@ -482,8 +542,14 @@ async function wakeSleep(args: ProcessorArgs, deps: SleepDeps, occurrence: Sleep
         return;
       }
     }
-    if (leaseStore) await markRunLive({ scope, store: leaseStore, runId, logger });
-    if (await lost()) return;
+
+    if (leaseStore) {
+      await markRunLive({ scope, store: leaseStore, runId, logger });
+    }
+
+    if (await lost()) {
+      return;
+    }
 
     const endedAt = Date.now();
     await workflowsStore?.updateWorkflowResults({
@@ -558,14 +624,22 @@ async function wakeSleep(args: ProcessorArgs, deps: SleepDeps, occurrence: Sleep
       throw error;
     }
   } finally {
-    if (lease) active?.delete(lease);
-    if (published) await lease?.release();
-    else if (lease && interrupted) {
+    if (lease) {
+      active?.delete(lease);
+    }
+
+    // Released only after a publish: the released lease marks the occurrence woken.
+    if (published) {
+      await lease?.release();
+    } else if (lease && interrupted) {
       // The timer that started this wake is gone, so the wake is kept for resumeSleepWakes. Its own
       // lease would hold the next attempt off for a lease TTL.
       await lease.lapse();
       scheduleWake(args, deps, occurrence);
-    } else lease?.abandon();
+    } else {
+      // Left to lapse, so another wake can claim the occurrence once this one is surely gone.
+      lease?.abandon();
+    }
   }
 }
 
@@ -577,7 +651,11 @@ async function revertWake(args: ProcessorArgs, deps: SleepDeps, occurrence: Slee
   const { workflowId, runId, requestContext } = args;
   const snapshot = await deps.workflowsStore?.loadWorkflowSnapshot({ workflowName: workflowId, runId });
   const stored = snapshot?.context?.[occurrence.stepId];
-  if (stored?.status !== 'success' || stored.startedAt !== occurrence.startedAt || stored.endedAt !== endedAt) return;
+  // Another wake or a later step may have written the result since; only this wake's own write goes back.
+  if (stored?.status !== 'success' || stored.startedAt !== occurrence.startedAt || stored.endedAt !== endedAt) {
+    return;
+  }
+
   await deps.workflowsStore?.updateWorkflowResults({
     workflowName: workflowId,
     runId,
@@ -601,7 +679,11 @@ async function markWokenSleepFinished(args: ProcessorArgs, deps: SleepDeps, occu
   const { workflowId, runId, requestContext } = args;
   const snapshot = await deps.workflowsStore?.loadWorkflowSnapshot({ workflowName: workflowId, runId });
   const stored = snapshot?.context?.[occurrence.stepId];
-  if (stored?.status !== 'waiting' || stored.startedAt !== occurrence.startedAt) return;
+  // A sleep started again since (a time travel) is another occurrence and keeps its result.
+  if (stored?.status !== 'waiting' || stored.startedAt !== occurrence.startedAt) {
+    return;
+  }
+
   await deps.workflowsStore?.updateWorkflowResults({
     workflowName: workflowId,
     runId,

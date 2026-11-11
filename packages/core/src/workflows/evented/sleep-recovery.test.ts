@@ -34,6 +34,7 @@ import {
   sleepingFor,
   sleepingRunId,
   sleepingWorkflows,
+  startInBackground,
   startReplica,
   stopReplicas,
   work,
@@ -60,7 +61,7 @@ describe('recovery of evented runs in a sleep (#30012)', () => {
       const a = await replica('A');
       await replica('B', scanning);
       const run = await a.workflow.createRun();
-      void run.start({ inputData: { n: 1 } });
+      startInBackground(run, { n: 1 });
       const sleeping = await sleepingRunId(storage, run.runId);
       const restarts = await recordRestarts(storage, run.runId);
 
@@ -97,7 +98,7 @@ describe('recovery of evented runs in a sleep (#30012)', () => {
       const a = await startReplica(storage, build(seen.reporter('A')));
       const b = await startReplica(storage, build(seen.reporter('B')), { recovery: { workflows: 'off' } });
       const run = await a.workflow.createRun();
-      void run.start({ inputData: { n: 1 } });
+      startInBackground(run, { n: 1 });
       await sleepingRunId(storage, run.runId);
       await crash(a, storage, [runLivenessKey(run.runId)]);
       const due = seen.at['A:before']! + 1_500;
@@ -123,7 +124,7 @@ describe('recovery of evented runs in a sleep (#30012)', () => {
     const a = await startReplica(storage, sleepingFor(300)(seen.reporter('A')));
     await startReplica(storage, sleepingFor(300)(seen.reporter('B')), { recovery: scanning });
     const run = await a.workflow.createRun();
-    void run.start({ inputData: { n: 1 } });
+    startInBackground(run, { n: 1 });
     await sleepingRunId(storage, run.runId);
     await crash(a, storage, [runLivenessKey(run.runId)]);
 
@@ -159,7 +160,7 @@ describe('recovery of evented runs in a sleep (#30012)', () => {
     const a = await startReplica(storage, sleepingFor(300)(seen.reporter('A')), { pubsub: pubsubA });
     const b = await startReplica(storage, sleepingFor(300)(seen.reporter('B')), { recovery: { workflows: 'off' } });
     const run = await a.workflow.createRun();
-    void run.start({ inputData: { n: 1 } });
+    startInBackground(run, { n: 1 });
     await lost.promise;
     await crash(a, storage, [runLivenessKey(run.runId)]);
 
@@ -185,7 +186,7 @@ describe('recovery of evented runs in a sleep (#30012)', () => {
     const a = await startReplica(storage, sleepingFor(300)(seen.reporter('A')), { pubsub: pubsubA });
     await startReplica(storage, sleepingFor(300)(seen.reporter('B')), { recovery: scanning });
     const run = await a.workflow.createRun();
-    void run.start({ inputData: { n: 1 } });
+    startInBackground(run, { n: 1 });
 
     // Default stall threshold: only an overdue sleep gets the run restarted within the wait.
     await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 10_000 });
@@ -219,7 +220,7 @@ describe('recovery of evented runs in a sleep (#30012)', () => {
         recovery: loop ? { workflowScanIntervalMs: 60_000 } : { workflows: 'off' },
       });
       const run = await a.workflow.createRun();
-      void run.start({ inputData: { n: 1 } });
+      startInBackground(run, { n: 1 });
       await sleepingRunId(storage, run.runId);
       await crash(a, storage, [runLivenessKey(run.runId)]);
       if (legacy) {
@@ -241,7 +242,7 @@ describe('recovery of evented runs in a sleep (#30012)', () => {
     const a = await startReplica(storage, sleepingFor(500)(seen.reporter('A')));
     const b = await startReplica(storage, sleepingFor(500)(seen.reporter('B')), { recovery: { workflows: 'off' } });
     const run = await a.workflow.createRun();
-    void run.start({ inputData: { n: 1 } });
+    startInBackground(run, { n: 1 });
     await sleepingRunId(storage, run.runId);
     await crash(a, storage, [runLivenessKey(run.runId)]);
 

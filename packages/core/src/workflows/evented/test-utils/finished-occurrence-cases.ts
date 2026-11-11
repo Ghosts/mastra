@@ -22,7 +22,7 @@ import type { Workflow } from '../../workflow';
 import { runLivenessKey, stepOccurrenceKey } from '../leases';
 import { WorkflowEventProcessor } from '../workflow-event-processor';
 import { abandonLease } from './abandon-lease';
-import { Num, work } from './lease-replicas';
+import { Num, startInBackground, work } from './lease-replicas';
 import type { Report } from './lease-replicas';
 import { createStep, createWorkflow } from '..';
 
@@ -200,15 +200,6 @@ function recordWorkflowEvents(inner: PubSub, intercept: Intercept = () => undefi
     },
   });
   return { pubsub, published };
-}
-
-/**
- * Starts `run` without waiting for its result. The test reads the outcome from
- * storage, and the replica that started the run may crash or never see it end,
- * so a rejection is logged for the test's output instead of being awaited.
- */
-function startInBackground(run: { start: (args: { inputData: any }) => Promise<unknown> }, inputData: unknown) {
-  run.start({ inputData }).catch(error => console.error('A run started in the background rejected', error));
 }
 
 /**

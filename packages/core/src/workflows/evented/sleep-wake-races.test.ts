@@ -32,6 +32,7 @@ import {
   sleep,
   sleepingFor,
   sleepingRunId,
+  startInBackground,
   startReplica,
   stopReplicas,
   storedSleeps,
@@ -71,11 +72,17 @@ async function watchSleepLease(storage: Store, runId: () => string) {
     return result;
   });
   vi.spyOn(store, 'getRunOwnership').mockImplementation(async args => {
-    if (released && isSleepKeyOf(args.runId, runId())) secondWake.resolve();
+    if (released && isSleepKeyOf(args.runId, runId())) {
+      secondWake.resolve();
+    }
+
     return read(args);
   });
   vi.spyOn(store, 'claimRunOwnership').mockImplementation(async args => {
-    if (released && isSleepKeyOf(args.runId, runId())) secondWake.resolve();
+    if (released && isSleepKeyOf(args.runId, runId())) {
+      secondWake.resolve();
+    }
+
     return claim(args);
   });
   return { store, woken: woken.promise, secondWake: secondWake.promise };
@@ -112,8 +119,14 @@ describe('waking an evented sleep once (#30012)', () => {
         await refused.promise;
       }
       const result = await claim(args);
-      if (args.runId === restartLeaseKey(run.runId)) restarts.push(result.acquired);
-      if (isSleepKeyOf(args.runId, run.runId) && result.acquired) woken = true;
+      if (args.runId === restartLeaseKey(run.runId)) {
+        restarts.push(result.acquired);
+      }
+
+      if (isSleepKeyOf(args.runId, run.runId) && result.acquired) {
+        woken = true;
+      }
+
       return result;
     });
     vi.spyOn(store, 'getRunOwnership').mockImplementation(async args => {
@@ -141,7 +154,10 @@ describe('waking an evented sleep once (#30012)', () => {
     const reportA = seen.reporter('A');
     const onA = sleepingFor(800)(async label => {
       await reportA(label);
-      if (label === 'after') await lease.secondWake.catch(() => {});
+      if (label === 'after') {
+        // A missing second wake fails the test below, where it awaits `secondWake` itself.
+        await lease.secondWake.catch(() => {});
+      }
     });
     const a = await startReplica(storage, onA, { pubsub: seen.pubsub('A') });
     // B's restart reads the run while it sleeps, and its start event reaches B's workers only after A's wake.
@@ -175,13 +191,19 @@ describe('waking an evented sleep once (#30012)', () => {
     const lease = await watchSleepLease(storage, () => runId);
     let sleepEvent: Event | undefined;
     const pubsubA = interceptWorkflowEvents(seen.pubsub('A'), event => {
-      if (isStepRunAt(event, [1])) sleepEvent ??= structuredClone(event);
+      if (isStepRunAt(event, [1])) {
+        sleepEvent ??= structuredClone(event);
+      }
+
       return undefined;
     });
     const reportA = seen.reporter('A');
     const onA = sleepingFor(800)(async label => {
       await reportA(label);
-      if (label === 'after') await lease.secondWake.catch(() => {});
+      if (label === 'after') {
+        // A missing second wake fails the test below, where it awaits `secondWake` itself.
+        await lease.secondWake.catch(() => {});
+      }
     });
     const a = await startReplica(storage, onA, { pubsub: pubsubA });
     const pubsubB = seen.pubsub('B');
@@ -219,7 +241,10 @@ describe('waking an evented sleep once (#30012)', () => {
     const seen = observe('leased');
     let sleepEvent: Event | undefined;
     const pubsubA = interceptWorkflowEvents(new EventEmitterPubSub(), event => {
-      if (isStepRunAt(event, [1])) sleepEvent ??= structuredClone(event);
+      if (isStepRunAt(event, [1])) {
+        sleepEvent ??= structuredClone(event);
+      }
+
       return undefined;
     });
     const a = await startReplica(storage, sleepingFor(10)(seen.reporter('A')), { pubsub: pubsubA });
@@ -243,13 +268,15 @@ describe('waking an evented sleep once (#30012)', () => {
     // Node warns when it shortens a timer set past the longest delay to 1 ms.
     const overflows: string[] = [];
     const onWarning = (warning: Error) => {
-      if (warning.name === 'TimeoutOverflowWarning') overflows.push(warning.message);
+      if (warning.name === 'TimeoutOverflowWarning') {
+        overflows.push(warning.message);
+      }
     };
     process.on('warning', onWarning);
     try {
       const a = await startReplica(storage, sleepingFor(2 ** 31 + 60_000)(seen.reporter('A')));
       const run = await a.workflow.createRun();
-      void run.start({ inputData: { n: 1 } });
+      startInBackground(run, { n: 1 });
       await vi.waitFor(async () => {
         const snapshot = await store.loadWorkflowSnapshot({ workflowName: 'leased', runId: run.runId });
         const sleeps = Object.values(snapshot?.context ?? {}) as {
@@ -279,7 +306,10 @@ describe('waking an evented sleep once (#30012)', () => {
       createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num })
         .then(work('before', report))
         .sleep(async () => {
-          if (++resolutions > 1) await afterRan.promise;
+          if (++resolutions > 1) {
+            await afterRan.promise;
+          }
+
           return 50;
         })
         .then(
@@ -293,7 +323,9 @@ describe('waking an evented sleep once (#30012)', () => {
     // The sleep's event reaches B too, as a broker that delivers a message twice would.
     const pubsubA = interceptWorkflowEvents(seen.pubsub('A'), event => {
       if (isStepRunAt(event, [1]) && (event.data as { workflowId?: string }).workflowId === 'leased') {
-        void pubsubB.publish('workflows', structuredClone(event));
+        pubsubB
+          .publish('workflows', structuredClone(event))
+          .catch(error => console.error("Delivering the sleep's event to B failed", error));
       }
       return undefined;
     });
@@ -305,7 +337,7 @@ describe('waking an evented sleep once (#30012)', () => {
     const run = await a.workflow.createRun();
 
     // Either replica may set the sleep up and finish the run, so the run's end is read from storage.
-    void run.start({ inputData: { n: 1 } });
+    startInBackground(run, { n: 1 });
     await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 5_000 });
     // Stopping the workers waits for the deliveries they are handling.
     await b.mastra.stopWorkers();
@@ -341,7 +373,7 @@ describe('waking an evented sleep once (#30012)', () => {
         }
         return result;
       });
-      void run.start({ inputData: { n: 1 } });
+      startInBackground(run, { n: 1 });
       const key = await wakeKey.promise;
       await vi.waitFor(async () => expect(await storedSleeps(storage, run.runId)).toEqual(['success']));
 
@@ -379,7 +411,10 @@ describe('waking an evented sleep once (#30012)', () => {
     let wakeKey: string | undefined;
     vi.spyOn(store, 'claimRunOwnership').mockImplementation(async args => {
       const result = await claim(args);
-      if (result.acquired && isSleepKeyOf(args.runId, run.runId)) wakeKey = args.runId;
+      if (result.acquired && isSleepKeyOf(args.runId, run.runId)) {
+        wakeKey = args.runId;
+      }
+
       return result;
     });
     vi.spyOn(store, 'renewRunOwnership').mockImplementation(async args => {
@@ -389,7 +424,7 @@ describe('waking an evented sleep once (#30012)', () => {
       }
       return renew(args);
     });
-    void run.start({ inputData: { n: 1 } });
+    startInBackground(run, { n: 1 });
     await checking.promise;
     await a.mastra.stopWorkers({ drainTimeout: 0 });
     stopped.resolve();
@@ -419,7 +454,7 @@ describe('waking an evented sleep once (#30012)', () => {
       }
       return claim(args);
     });
-    void run.start({ inputData: { n: 1 } });
+    startInBackground(run, { n: 1 });
     await claiming.promise;
     await a.mastra.stopWorkers({ drainTimeout: 0 });
     stopped.resolve();
@@ -457,7 +492,7 @@ describe('waking an evented sleep once (#30012)', () => {
       recovery: { workflows: 'off' },
     });
     const run = await a.workflow.createRun();
-    void run.start({ inputData: { n: 1 } });
+    startInBackground(run, { n: 1 });
     await resolving.promise;
 
     await a.mastra.stopWorkers({ drainTimeout: 0 });
@@ -528,7 +563,10 @@ describe('waking an evented sleep once (#30012)', () => {
         execute: async ({ inputData }) => {
           await report(id);
           // The time-travelled run is still running when the canceled run's timer fires.
-          if (travelling && id === 'after') await sleep(600);
+          if (travelling && id === 'after') {
+            await sleep(600);
+          }
+
           return inputData;
         },
       });
@@ -543,7 +581,7 @@ describe('waking an evented sleep once (#30012)', () => {
       recovery: { workflows: 'off' },
     });
     const run = await a.workflow.createRun();
-    void run.start({ inputData: { n: 1 } });
+    startInBackground(run, { n: 1 });
     await sleepingRunId(storage, run.runId);
     await run.cancel();
     await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('canceled'));
@@ -591,10 +629,10 @@ describe('waking an evented sleep once (#30012)', () => {
       .commit();
     const a = await startReplica(storage, workflow as unknown as Built, { recovery: { workflows: 'off' } });
     const sleeping = await a.workflow.createRun();
-    void sleeping.start({ inputData: { n: 1 } });
+    startInBackground(sleeping, { n: 1 });
     await sleepingRunId(storage, sleeping.runId);
     const held = await a.workflow.createRun();
-    void held.start({ inputData: { n: 2 } });
+    startInBackground(held, { n: 2 });
     await draining.promise;
 
     const stopping = a.mastra.stopWorkers({ drainTimeout: 5_000 });
@@ -617,7 +655,7 @@ describe('waking an evented sleep once (#30012)', () => {
       recovery: { workflows: 'off' },
     });
     const run = await a.workflow.createRun();
-    void run.start({ inputData: { n: 1 } });
+    startInBackground(run, { n: 1 });
     await sleepingRunId(storage, run.runId);
 
     await a.mastra.stopWorkers();
@@ -654,10 +692,13 @@ describe('waking an evented sleep once (#30012)', () => {
     });
     vi.spyOn(store, 'renewRunOwnership').mockImplementation(async args => {
       const result = await renew(args);
-      if (args.runId === wakeKey && !result.renewed) refused = true;
+      if (args.runId === wakeKey && !result.renewed) {
+        refused = true;
+      }
+
       return result;
     });
-    void run.start({ inputData: { n: 1 } });
+    startInBackground(run, { n: 1 });
     await vi.waitFor(() => expect(held).toBe(true));
     await claim({ runId: wakeKey!, ownerId: 'another-process', leaseMs: 60_000, force: true });
     stolen.resolve();

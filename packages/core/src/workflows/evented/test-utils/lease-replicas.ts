@@ -377,6 +377,15 @@ export async function restartOutcome(replica: { workflow: Built }, runId: string
   );
 }
 
+/**
+ * Starts `run` without waiting for its result. The test reads the outcome from
+ * storage, and the replica that started the run may crash or never see it end,
+ * so a rejection is logged for the test's output instead of being awaited.
+ */
+export function startInBackground(run: { start: (args: { inputData: any }) => Promise<unknown> }, inputData: unknown) {
+  run.start({ inputData }).catch(error => console.error('A run started in the background rejected', error));
+}
+
 /** Waits `ms`, for the tests that must let a lease TTL pass. */
 export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 

@@ -12,7 +12,10 @@ export async function forgetWakeTime(
   const store = (await storage.getStore('workflows'))!;
   const snapshot = (await store.loadWorkflowSnapshot({ workflowName, runId }))!;
   for (const result of Object.values(snapshot.context) as { status?: string; metadata?: unknown }[]) {
-    if (result?.status === 'waiting') delete result.metadata;
+    if (result?.status === 'waiting') {
+      delete result.metadata;
+    }
   }
+
   await store.persistWorkflowSnapshot({ workflowName, runId, snapshot });
 }

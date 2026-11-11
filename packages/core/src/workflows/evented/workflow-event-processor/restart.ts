@@ -10,7 +10,11 @@ import { resolveCurrentState } from '../helpers';
  * this process's graph does not use.
  */
 function finishedSleepAt(restart: RestartExecutionParams, index: number): string | undefined {
-  if (restart.activePaths.length !== 1 || restart.activePaths[0] !== index) return;
+  // Only the top-level entry the run is at: a sleep inside a parallel or nested branch has a longer path.
+  if (restart.activePaths.length !== 1 || restart.activePaths[0] !== index) {
+    return undefined;
+  }
+
   return Object.entries(restart.activeStepsPath ?? {}).find(
     ([id, path]) => path?.length === 1 && path[0] === index && restart.stepResults[id]?.status === 'success',
   )?.[0];
@@ -59,7 +63,8 @@ export function resolveCompletedRestartEntry(
       entry.type === 'foreach' || entry.type === 'loop'
         ? getEntryId(entry.step)
         : entry.type === 'sleep' || entry.type === 'sleepUntil'
-          ? results[entry.id]?.status === 'success'
+          ? // This process's id first; another process may have stored the sleep under its own.
+            results[entry.id]?.status === 'success'
             ? entry.id
             : (finishedSleepAt(restart, index) ?? entry.id)
           : getEntryId(entry);
