@@ -94,6 +94,9 @@ interface SleepOccurrence {
 
 type SleepEntry = Extract<StepFlowEntry, { type: 'sleep' | 'sleepUntil' }>;
 
+/** Resolves a sleep's duration in milliseconds; `state` is what the duration function's `setState()` changes. */
+type ResolveDuration = (requestContext: RequestContext, state: Record<string, any>) => Promise<number>;
+
 /** A wake this process set a timer for, or put aside while its workers are stopped. */
 interface PendingWake {
   args: ProcessorArgs;
@@ -176,12 +179,13 @@ export async function processWorkflowSleep(
   args: ProcessorArgs,
   deps: SleepDeps & { step: Extract<StepFlowEntry, { type: 'sleep' }> },
 ) {
-  return startSleep(args, deps, requestContext =>
+  return startSleep(args, deps, (requestContext, state) =>
     deps.stepExecutor.resolveSleep({
       workflowId: args.workflowId,
       step: deps.step,
       runId: args.runId,
       stepResults: args.stepResults,
+      state,
       requestContext,
       input: args.prevResult?.status === 'success' ? args.prevResult.output : undefined,
       resumeData: args.resumeData,
@@ -195,12 +199,13 @@ export async function processWorkflowSleepUntil(
   args: ProcessorArgs,
   deps: SleepDeps & { step: Extract<StepFlowEntry, { type: 'sleepUntil' }> },
 ) {
-  return startSleep(args, deps, requestContext =>
+  return startSleep(args, deps, (requestContext, state) =>
     deps.stepExecutor.resolveSleepUntil({
       workflowId: args.workflowId,
       step: deps.step,
       runId: args.runId,
       stepResults: args.stepResults,
+      state,
       requestContext,
       input: args.prevResult?.status === 'success' ? args.prevResult.output : undefined,
       resumeData: args.resumeData,
@@ -231,7 +236,7 @@ export async function processWorkflowSleepUntil(
 async function startSleep(
   args: ProcessorArgs,
   deps: SleepDeps & { step: SleepEntry },
-  resolveDuration: (requestContext: RequestContext) => Promise<number>,
+  resolveDuration: ResolveDuration,
 ) {
   const { workflowId, runId, executionPath } = args;
   const start = deps.leaseStore
@@ -262,7 +267,7 @@ async function startSleep(
 async function setUpSleep(
   args: ProcessorArgs,
   deps: SleepDeps & { step: SleepEntry },
-  resolveDuration: (requestContext: RequestContext) => Promise<number>,
+  resolveDuration: ResolveDuration,
   start: SleepWakeLease | undefined,
 ) {
   const { workflow, workflowId, runId, executionPath, activeStepsPath, prevResult, requestContext, timeTravel } = args;
@@ -334,15 +339,30 @@ async function setUpSleep(
   // doesn't call the function again, so the next step would otherwise get the state from before it.
   let changedState: Record<string, any> | undefined;
   if (wakeAt === undefined) {
-    // resolveDuration's `setState()` changes `stepResults.__state` in place.
-    const state = args.stepResults?.__state as Record<string, any> | undefined;
-    const stateBefore = JSON.stringify(state);
+    // `setState()` assigns into the state object in place, which the proxy notices without
+    // comparing serialized copies: run state may hold values JSON can't, such as a bigint.
+    const state = (args.stepResults?.__state ?? {}) as Record<string, any>;
+    let stateChanged = false;
+    const tracked = new Proxy(state, {
+      set(target, key, value, receiver) {
+        stateChanged = true;
+        return Reflect.set(target, key, value, receiver);
+      },
+      deleteProperty(target, key) {
+        stateChanged = true;
+        return Reflect.deleteProperty(target, key);
+      },
+    });
     // Create a proper RequestContext from the plain object passed in ProcessorArgs
-    const duration = await resolveDuration(new RequestContext(Object.entries(requestContext ?? {}) as any));
+    const duration = await resolveDuration(new RequestContext(Object.entries(requestContext ?? {}) as any), tracked);
     wakeAt = Date.now() + (Number.isFinite(duration) ? Math.max(0, duration) : 0);
     // Only a change is written: a parallel branch may have stored newer state than this delivery's copy.
-    if (JSON.stringify(state) !== stateBefore) {
+    if (stateChanged) {
       changedState = state;
+      // The wake passes the step results on; a run without state yet gets this new object.
+      if (args.stepResults && !args.stepResults.__state) {
+        (args.stepResults as Record<string, unknown>).__state = state;
+      }
     }
 
     // The duration function can run for long. A start lease that lapsed meanwhile, its renewals

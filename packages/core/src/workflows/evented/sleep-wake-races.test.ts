@@ -540,6 +540,19 @@ describe('waking an evented sleep once (#30012)', () => {
     expect(seen.executions).toEqual(['A:before', 'A:after']);
   }, 20_000);
 
+  it('sets up a sleep in a run whose state JSON cannot hold', async () => {
+    const storage = new InMemoryStore();
+    const seen = observe('leased');
+    const a = await startReplica(storage, sleepingFor(50)(seen.reporter('A')), { recovery: { workflows: 'off' } });
+    const run = await a.workflow.createRun();
+
+    // The in-memory store and the in-process pubsub keep a bigint as it is.
+    const result = await run.start({ inputData: { n: 1 }, initialState: { value: 1n } } as any);
+
+    expect(result.status).toBe('success');
+    expect(seen.executions).toEqual(['A:before', 'A:after']);
+  }, 20_000);
+
   it('stops a sleep setup whose start lease another process took while its duration resolved', async () => {
     const storage = new InMemoryStore();
     const store = (await storage.getStore('workflows'))!;
