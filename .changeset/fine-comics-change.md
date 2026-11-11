@@ -23,6 +23,6 @@ export const mastra = new Mastra({
 });
 ```
 
-`mastra.restartAllActiveWorkflowRuns()` now applies the same rules on storage with run ownership support, so it no longer restarts a sleeping evented run or a run that may only be waiting for its next step. Pass `{ mode: 'all' }` to restart every active run no instance keeps alive, as before. It also no longer schedules its own check of a run another instance still holds. An instance that runs workers checks that run again on its recovery loop; an instance without workers doesn't check it again.
+`mastra.restartAllActiveWorkflowRuns()` now applies the same rules on storage with run ownership support. It no longer restarts a sleeping evented run or a run that may only be waiting for its next step. Pass `{ mode: 'all' }` to restart every active run no instance keeps alive, as before. It also no longer schedules its own check of a run another instance still holds. An instance that runs workers checks that run again on its recovery loop. An instance without workers doesn't check it again.
 
 The in-memory store now moves a run's `updatedAt` on every write to the run, as the database stores do. The recovery loop reads it to find stalled runs.
