@@ -107,7 +107,6 @@ import {
 } from '../workflows/dynamic';
 import {
   endRunLiveness,
-  isRunAsleep,
   lastWriteOf,
   loadNestedRuns,
   nestedRunLeaseKeys,
@@ -115,9 +114,12 @@ import {
   nestedRunStoppedMidStep,
   runLivenessKey,
   runningStepOccurrenceKeys,
+  sleepRecoveryState,
   stoppedMidStep,
 } from '../workflows/evented/leases';
+import { forEachBounded } from '../workflows/evented/leases/bounded';
 import { WorkflowEventProcessor } from '../workflows/evented/workflow-event-processor';
+import { pauseSleepWakes, resumeSleepWakes } from '../workflows/evented/workflow-event-processor/sleep';
 import {
   cancelNestedRun,
   createNestedRunParentStatusLookup,
@@ -794,9 +796,11 @@ export interface MastraRecoveryConfig {
    * loop restarts it. Covers a run whose next step message was lost, and an
    * evented run that waits for its next step message, which no lease reports
    * either way. A run whose process stopped mid-step is restarted sooner. The
-   * loop leaves evented runs in a `sleep()` or `sleepUntil()` step alone after
-   * its first pass. Keep it above four lease TTLs: a restart that no worker
-   * took up yet keeps other instances from restarting the run for that long.
+   * loop leaves an evented run in a `sleep()` or `sleepUntil()` step alone
+   * until the sleep is a lease TTL past its stored end time; its first pass
+   * also restarts a run in a sleep stored without an end time. Keep it above
+   * four lease TTLs: a restart that no worker took up yet keeps other
+   * instances from restarting the run for that long.
    * @default 300_000
    */
   workflowStallThresholdMs?: number;
@@ -897,6 +901,8 @@ const DEFAULT_WORKFLOW_SCAN_INTERVAL_MS = 60_000;
 const DEFAULT_WORKFLOW_STALL_THRESHOLD_MS = 5 * 60_000;
 // Longer timer delays overflow and fire at once.
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+// Runs a recovery pass checks for a sleep at once.
+const SLEEP_CHECK_CONCURRENCY = 8;
 
 /** Whether a recovery pass applies the boot pass rules to a run it inspects. */
 type BootRule = (run: WorkflowRuns['runs'][number]) => boolean;
@@ -4490,16 +4496,22 @@ export class Mastra<
    * batches of a hundred, each batch's leases read with one
    * `getRunOwnerships()` call. By default (`{ mode: 'all' }`) every active
    * run whose liveness key or run lease no process keeps live is restarted,
-   * sleeping runs included, without waiting for a stall or a lease grace. Use
-   * it when you know no process still drives the runs, for example after an
-   * outage of every instance.
+   * without waiting for a stall or a lease grace. Use it when you know no
+   * process still drives the runs, for example after an outage of every
+   * instance. On a store with run ownership support, an instance that runs the
+   * recovery loop leaves an evented run in a sleep with a stored end time
+   * alone until the sleep is overdue, and its loop restarts the run then.
+   * Without that loop the run is restarted at once, and the restart waits only
+   * for what's left of the sleep.
    *
    * `{ mode: 'orphaned' }` applies the rules the recovery loop applies (see
    * `recovery.workflowStallThresholdMs`) on a store with run ownership support
    * (`supportsRunFencing()`): a run another process still keeps alive and a
    * run that may only be waiting for its next step are left alone. An evented
-   * run in a sleep is restarted only by the instance's first such pass, its
-   * boot pass, and left alone after it. When the boot pass fails to read some
+   * run in a sleep is restarted once the sleep is overdue, or at once by an
+   * instance that runs no recovery loop, as in `all` mode. The instance's first
+   * such pass, its boot pass, also restarts one whose sleep was stored without
+   * an end time. When the boot pass fails to read some
    * runs, the next pass applies its rules to the runs not written since. The
    * server's boot-time call uses this mode and joins the first pass of the
    * recovery loop `startWorkers()` started. A call made before
@@ -4724,7 +4736,7 @@ export class Mastra<
       runs.map(run => ownershipKey(run.runId)),
     );
 
-    return runs.filter(run => {
+    const unowned = runs.filter(run => {
       if (!owners?.get(ownershipKey(run.runId))?.live) {
         return true;
       }
@@ -4735,6 +4747,59 @@ export class Mastra<
       });
       return false;
     });
+
+    // Without this instance's loop nothing would check a sleeping run again, so it is restarted.
+    if (!evented || !this.#workflowRecoveryLoop) {
+      return unowned;
+    }
+
+    return this.#withoutSleepsNotDue(unowned, workflowsStore);
+  }
+
+  /**
+   * `runs` without the evented runs in a sleep that stored its wake time and is not overdue yet
+   * (see `sleepRecoveryState`): its timer wakes it, or this instance's recovery loop once it is
+   * overdue. Applied only while that loop runs; otherwise nothing else would wake the sleep. A
+   * sleep without a stored wake time is kept, since a restart is its only recovery, and so is a
+   * run with a step, its own or a nested run's, whose worker stopped mid-step (the crash rule of
+   * an `orphaned` pass): its restart must not wait for a sleep in another branch.
+   */
+  async #withoutSleepsNotDue(runs: WorkflowRuns['runs'], workflowsStore: WorkflowsStorage) {
+    const sleepsOnly = async (run: WorkflowRuns['runs'][number]): Promise<boolean> => {
+      const snapshot = this.#parsedSnapshot(run);
+      if (!snapshot) {
+        return false;
+      }
+
+      const nested = await loadNestedRuns({ store: workflowsStore, snapshot });
+      if (sleepRecoveryState(snapshot, nested) !== 'asleep') {
+        return false;
+      }
+
+      const leases = await workflowsStore.getRunOwnerships({
+        runIds: [...runningStepOccurrenceKeys(run.runId, snapshot), ...nestedRunLeaseKeys(nested)],
+      });
+      return !stoppedMidStep(run.runId, snapshot, leases) && !nestedRunStoppedMidStep(nested, leases);
+    };
+
+    const asleep = new Set<WorkflowRuns['runs'][number]>();
+    // Each check may read the run's nested runs; a few at a time keeps a large batch from flooding the store.
+    await forEachBounded(runs, SLEEP_CHECK_CONCURRENCY, async run => {
+      try {
+        if (await sleepsOnly(run)) {
+          asleep.add(run);
+        }
+      } catch (error) {
+        // The run is kept: restarting a sleep resumes it where it was.
+        this.#logger.debug('Failed to read whether a workflow run only sleeps', {
+          workflow: run.workflowName,
+          runId: run.runId,
+          error,
+        });
+      }
+    });
+
+    return runs.filter(run => !asleep.has(run));
   }
 
   /**
@@ -4869,14 +4934,21 @@ export class Mastra<
    *   it drives lost the worker running one of its steps. A released step lease means the step
    *   finished and its next event is on its way, which a busy broker can hold back for longer
    *   than a lease lasts; that run, like one between steps, waits for the stall rule below.
+   * - An evented run in a sleep holds no lease until the timer of the process that started the
+   *   sleep wakes it. Once a sleep is a lease TTL past its stored wake time (see
+   *   `sleepRecoveryState`), that timer most likely died with its process, and the run is
+   *   restarted: the restart resumes the sleep, which then wakes at once. Until then the run is
+   *   left alone, on the `boot` pass too, while this instance runs the recovery loop. An instance
+   *   without the loop restarts it at once, since nothing would check it again; the restart
+   *   waits for what's left of the sleep.
    * - On the `boot` pass with a pubsub that lives in this process only (`EventEmitterPubSub`), an
    *   evented run whose liveness lapsed is restarted: the messages it waited for died with the
    *   process that published them. So is one whose liveness was released, on any pass: such a
    *   process releases the keys it wrote when it shuts down. A key another process keeps live is
    *   left alone even then, since that process may be a replica driving its own runs.
-   * - Otherwise an evented run in a sleep is left alone: it holds no lease until its timer
-   *   wakes it. The instance's `boot` pass restarts it instead, since the process whose timer
-   *   would wake it may be the one that stopped; the restart replays the sleep.
+   * - A run in a sleep stored without a wake time is restarted only by the instance's `boot`
+   *   pass, since the process whose timer would wake it may be the one that stopped; the restart
+   *   replays the sleep.
    * - A default-engine run keeps its run lease from start to end. One lease TTL after its lease
    *   lapsed, its process stopped: a process that stops renewing for a moment (a blocked event
    *   loop) renews again within that grace. A released lease on a `running` run is a resume or
@@ -4911,8 +4983,9 @@ export class Mastra<
       const unwrittenFor = now - new Date(run.updatedAt).getTime();
 
       if (evented) {
-        // A crashed step is restarted even while another branch sleeps: the restart replays that
-        // sleep, while deferring to it could leave the crashed branch for as long as the sleep lasts.
+        // A crashed step is restarted even while another branch sleeps: the restart resumes that
+        // sleep (or replays one stored without its wake time), while deferring to it could leave
+        // the crashed branch for as long as the sleep lasts.
         if (stoppedMidStep(run.runId, snapshot, leases)) {
           return true;
         }
@@ -4932,6 +5005,19 @@ export class Mastra<
           return false;
         }
 
+        // Its timer died with its process; the restart wakes it at once.
+        const sleep = sleepRecoveryState(snapshot, nested);
+        if (sleep === 'overdue') {
+          return true;
+        }
+
+        // A sleep that stored its wake time waits for its timer, or for this instance's loop to find
+        // it overdue, on the boot pass too. Without that loop nothing would check it again, so it is
+        // restarted, and the restart waits only for what's left of the sleep.
+        if (sleep === 'asleep') {
+          return !this.#workflowRecoveryLoop;
+        }
+
         // With a pubsub that lives in this process only, the messages of a run whose liveness
         // lapsed before this instance started died with the process that published them. A
         // released key means its process shut down, so that holds on any pass.
@@ -4940,8 +5026,9 @@ export class Mastra<
           return true;
         }
 
-        // A sleep holds no lease; only the boot pass assumes the process that would wake it stopped.
-        if (isRunAsleep(snapshot, nested)) {
+        // A sleep stored without its wake time can't tell when it is overdue; only the boot pass
+        // assumes the process whose timer would wake it stopped. Its restart starts it over.
+        if (sleep === 'untimed') {
           return boot;
         }
 
@@ -8170,6 +8257,8 @@ export class Mastra<
     // runs in storage alone, so a script that never calls startWorkers() never sweeps them.
     if (!name) {
       this.#startWorkflowRecoveryLoop();
+      // The wakes of sleeps this instance started before its workers last stopped.
+      resumeSleepWakes(this);
     }
   }
 
@@ -8316,6 +8405,8 @@ export class Mastra<
 
     await this.#wirePushWorkflowSubscription();
     this.#executionWorkersStarted = true;
+    // A lazy start, for example from a restart, takes up the wakes the last stopWorkers() put aside.
+    resumeSleepWakes(this);
   }
 
   /**
@@ -8353,6 +8444,9 @@ export class Mastra<
     // are dropped. Restarts already running go on and are drained like any run.
     this.#stopWorkflowRecoveryLoop();
     this.#workflowRecoveries.close();
+    // Before the consumers go: a sleep woken during the drain would publish its next step to no
+    // worker. Sleeps the drained runs start meanwhile are put aside too.
+    pauseSleepWakes(this);
 
     // Stop registered workers in reverse order
     for (const worker of [...this.#workers].reverse()) {
@@ -8775,8 +8869,10 @@ export class Mastra<
       await this.#shutdown(options);
     } finally {
       // A shutdown that failed before its drain finished must not keep vouching for the evented
-      // runs it drove. Ending the liveness twice changes nothing.
+      // runs it drove, nor wake their sleeps. Ending the liveness or pausing the wakes twice
+      // changes nothing.
       if (this.#shuttingDown) {
+        pauseSleepWakes(this);
         await endRunLiveness(this, { release: this.__inProcessPubsub });
       }
     }

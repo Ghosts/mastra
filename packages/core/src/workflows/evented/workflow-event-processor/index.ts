@@ -2180,6 +2180,9 @@ export class WorkflowEventProcessor extends EventProcessor {
           pubsub: this.mastra.pubsub,
           stepExecutor: this.stepExecutor,
           workflowsStore: await this.mastra.getStorage()?.getStore('workflows'),
+          leaseStore: await this.#leaseStore(workflow),
+          scope: this.mastra,
+          logger: this.mastra.getLogger(),
           step,
         },
       );
@@ -2208,6 +2211,9 @@ export class WorkflowEventProcessor extends EventProcessor {
           pubsub: this.mastra.pubsub,
           stepExecutor: this.stepExecutor,
           workflowsStore: await this.mastra.getStorage()?.getStore('workflows'),
+          leaseStore: await this.#leaseStore(workflow),
+          scope: this.mastra,
+          logger: this.mastra.getLogger(),
           step,
         },
       );

@@ -3,6 +3,19 @@ import type { RestartExecutionParams, StepFlowEntry, StepResult } from '../../ty
 import { getStepIds } from '../../utils';
 import { resolveCurrentState } from '../helpers';
 
+/**
+ * The id of a finished sleep the run lists as active at its current path
+ * `[index]`. A sleep declared without an `id` gets a new generated id in every
+ * process that builds the workflow, so its result may be stored under an id
+ * this process's graph does not use.
+ */
+function finishedSleepAt(restart: RestartExecutionParams, index: number): string | undefined {
+  if (restart.activePaths.length !== 1 || restart.activePaths[0] !== index) return;
+  return Object.entries(restart.activeStepsPath ?? {}).find(
+    ([id, path]) => path?.length === 1 && path[0] === index && restart.stepResults[id]?.status === 'success',
+  )?.[0];
+}
+
 /** Recognize only the captured occurrence; a saved ID may also occur later in the graph. */
 export function resolveCompletedRestartEntry(
   graph: StepFlowEntry[],
@@ -46,7 +59,9 @@ export function resolveCompletedRestartEntry(
       entry.type === 'foreach' || entry.type === 'loop'
         ? getEntryId(entry.step)
         : entry.type === 'sleep' || entry.type === 'sleepUntil'
-          ? entry.id
+          ? results[entry.id]?.status === 'success'
+            ? entry.id
+            : (finishedSleepAt(restart, index) ?? entry.id)
           : getEntryId(entry);
     const result = results[id];
     if (result?.status !== 'success') return;

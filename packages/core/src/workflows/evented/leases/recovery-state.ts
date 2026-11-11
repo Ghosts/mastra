@@ -1,6 +1,6 @@
 /**
  * What the recovery loop reads from a stored evented run to tell whether its process stopped: the
- * steps it shows running, the nested runs it drives and whether it sleeps.
+ * steps it shows running and the nested runs it drives. Its sleeps are read in `./sleep`.
  */
 import type { WorkflowsStorage } from '../../../storage/domains/workflows/base';
 import type { RunOwnershipRecord } from '../../../storage/run-fencing';
@@ -54,7 +54,7 @@ function runningNestedRunIds(result: { status?: unknown; metadata?: unknown; out
 }
 
 /** The step results of a run's context, without the run input and state stored next to them. */
-function stepResultsOf(context: WorkflowRunState['context'] | undefined) {
+export function stepResultsOf(context: WorkflowRunState['context'] | undefined) {
   return Object.entries(context ?? {}).filter(([stepId]) => stepId !== 'input' && stepId !== '__state') as [
     string,
     { status?: unknown; metadata?: unknown; output?: unknown } | undefined,
@@ -253,27 +253,4 @@ export function lastWriteOf(updatedAt: number, nested: StoredNestedRun[]): numbe
     updatedAt,
     ...allNestedRuns(nested).map(run => (Number.isNaN(run.updatedAt) ? -Infinity : run.updatedAt)),
   );
-}
-
-/**
- * Whether the run, or one of the `nested` runs it drives, is in a `sleep` or
- * `sleepUntil` step. A sleep holds no lease: the process that started it wakes
- * the run with a timer, so a sleeping run looks orphaned to anything that only
- * reads leases. A sleep's result stays `waiting` after the run moves on, so
- * only a sleep the run lists in `activeStepsPath` at a path within its current
- * `activePaths` counts.
- */
-export function isRunAsleep(snapshot: WorkflowRunState, nested: StoredNestedRun[]): boolean {
-  const steps = stepResultsOf(snapshot.context);
-  const active = snapshot.activeStepsPath ?? {};
-  // A sleep id can linger in `activeStepsPath` after the run moved on; only a sleep on the
-  // run's current path counts.
-  const activePaths = snapshot.activePaths ?? [];
-  const current = (path: number[] | undefined) =>
-    Array.isArray(path) && activePaths.length > 0 && activePaths.every((index, i) => path[i] === index);
-  if (steps.some(([stepId, result]) => result?.status === 'waiting' && current(active[stepId]))) {
-    return true;
-  }
-
-  return nested.some(run => isRunAsleep(run.snapshot, run.nested));
 }
