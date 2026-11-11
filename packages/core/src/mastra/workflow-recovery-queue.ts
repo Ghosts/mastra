@@ -5,6 +5,8 @@ interface QueuedRecovery {
   runId: string;
   /** Checked when the run gets its slot; a run it finds no longer orphaned is not restarted. */
   stillOrphaned?: () => Promise<boolean>;
+  /** Set when a caller without a check joined while the check ran: the run restarts whatever it finds. */
+  force?: boolean;
   /** Settles once the run's restart settled, or once the entry was dropped before it started. */
   done: Promise<void>;
   settle: () => void;
@@ -63,7 +65,8 @@ export class WorkflowRecoveryQueue {
    *
    * `stillOrphaned` runs when the run gets its slot, since a run can wait for
    * one long enough to recover, move into a sleep or finish. A run queued
-   * again without it while it waits is restarted without the check.
+   * again without it while it waits, or while its check runs, is restarted
+   * whatever the check finds. Either way it is restarted at most once.
    */
   enqueue(workflowName: string, runId: string, stillOrphaned?: () => Promise<boolean>): Promise<void> {
     const key = JSON.stringify([workflowName, runId]);
@@ -79,6 +82,11 @@ export class WorkflowRecoveryQueue {
 
     const running = this.#running.get(key);
     if (running) {
+      // Its check may still be running; once the restart started, this changes nothing.
+      if (!stillOrphaned) {
+        running.force = true;
+      }
+
       return running.done;
     }
 
@@ -137,7 +145,8 @@ export class WorkflowRecoveryQueue {
       // Deferred one microtask, so a restart never runs inside the enqueue() call that queued it.
       await Promise.resolve();
 
-      if (entry.stillOrphaned && !(await entry.stillOrphaned())) {
+      // A caller that joined without a check during it overrides a check that found the run alive.
+      if (entry.stillOrphaned && !(await entry.stillOrphaned()) && !entry.force) {
         return;
       }
 
