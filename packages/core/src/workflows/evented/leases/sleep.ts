@@ -6,7 +6,11 @@
 import type { IMastraLogger } from '../../../logger';
 import type { WorkflowsStorage } from '../../../storage/domains/workflows/base';
 import type { RunFence, RunOwnershipRecord } from '../../../storage/run-fencing';
-import { WORKFLOW_RUN_LEASE_TTL_MS, renewWorkflowLease } from '../../run-ownership';
+import {
+  WORKFLOW_RUN_LEASE_RENEW_INTERVAL_MS,
+  WORKFLOW_RUN_LEASE_TTL_MS,
+  repeatAfterSettled,
+} from '../../run-ownership';
 import type { WorkflowRunState } from '../../types';
 import { allNestedRuns, stepResultsOf } from './recovery-state';
 import type { StoredNestedRun } from './recovery-state';
@@ -38,12 +42,25 @@ function holdSleepLease(
   const fence: RunFence = { runId: record.runId, generation: record.generation, ownerId: record.ownerId };
   const key = record.runId;
   let abandoned = false;
-  const stopRenewing = renewWorkflowLease({
-    store,
-    fence,
-    onLost: () => logger?.warn('Lost the lease of a workflow sleep', { key }),
-    onError: error => logger?.warn('Failed to renew the lease of a workflow sleep', { key, error }),
-  });
+  // The renewal in flight, if any. A store renews an unreleased lease even once it expired, so a
+  // renewal that lands after lapse() would hold the lease for another TTL; lapse() waits for it.
+  let renewing: Promise<void> = Promise.resolve();
+  // renewWorkflowLease's chain, plus the renewal in flight. Not setInterval, for the same reason as
+  // there: a slow store would get renewals piling up and landing out of order.
+  const stopRenewing = repeatAfterSettled(() => {
+    renewing = store.renewRunOwnership({ ...fence, leaseMs: WORKFLOW_RUN_LEASE_TTL_MS }).then(
+      result => {
+        if (!result.renewed) {
+          // Another claim superseded this one; renewing again could only fail the same way.
+          stopRenewing();
+          logger?.warn('Lost the lease of a workflow sleep', { key });
+        }
+      },
+      // A failed write may be transient, so the next tick tries again.
+      error => logger?.warn('Failed to renew the lease of a workflow sleep', { key, error }),
+    );
+    return renewing;
+  }, WORKFLOW_RUN_LEASE_RENEW_INTERVAL_MS);
 
   return {
     async release() {
@@ -61,6 +78,8 @@ function holdSleepLease(
     async lapse() {
       abandoned = true;
       stopRenewing();
+      // `renewing` never rejects: its failure is logged where it is created.
+      await renewing;
       // The fence fails once another process took the lease over, which leaves its lease alone.
       await store
         .renewRunOwnership({ ...fence, leaseMs: 1 })

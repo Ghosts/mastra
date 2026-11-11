@@ -480,6 +480,70 @@ describe('waking an evented sleep once (#30012)', () => {
     expect(seen.executions).toEqual(['A:before', 'A:after']);
   }, 20_000);
 
+  it("wakes a sleep once its workers start again when stopping them caught a renewal of the wake's lease", async () => {
+    const storage = new InMemoryStore();
+    const store = (await storage.getStore('workflows'))!;
+    const seen = observe('leased');
+    const a = await startReplica(storage, sleepingFor(100)(seen.reporter('A')), {
+      pubsub: seen.pubsub('A'),
+      recovery: { workflows: 'off' },
+    });
+    const run = await a.workflow.createRun();
+
+    // A's wake reads the run only once a renewal of its lease is under way, and that renewal
+    // lands only after the workers stopped and the wake gave up.
+    const claim = store.claimRunOwnership.bind(store);
+    const load = store.loadWorkflowSnapshot.bind(store);
+    const renew = store.renewRunOwnership.bind(store);
+    const renewing = Promise.withResolvers<void>();
+    const readHeld = Promise.withResolvers<void>();
+    const renewHeld = Promise.withResolvers<void>();
+    let wakeKey: string | undefined;
+    let readHolding = false;
+    let renewHolding = false;
+    vi.spyOn(store, 'claimRunOwnership').mockImplementation(async args => {
+      const result = await claim(args);
+      if (result.acquired && isSleepKeyOf(args.runId, run.runId)) {
+        wakeKey = args.runId;
+      }
+
+      return result;
+    });
+    vi.spyOn(store, 'loadWorkflowSnapshot').mockImplementation(async args => {
+      if (wakeKey && !readHolding && args.runId === run.runId) {
+        readHolding = true;
+        await readHeld.promise;
+      }
+
+      return load(args);
+    });
+    vi.spyOn(store, 'renewRunOwnership').mockImplementation(async args => {
+      if (args.runId === wakeKey && readHolding && !renewHolding) {
+        renewHolding = true;
+        renewing.resolve();
+        await renewHeld.promise;
+      }
+
+      return renew(args);
+    });
+    startInBackground(run, { n: 1 });
+    await renewing.promise;
+
+    await a.mastra.stopWorkers({ drainTimeout: 0 });
+    readHeld.resolve();
+    await sleep(100);
+    renewHeld.resolve();
+    await sleep(100);
+    await a.mastra.startWorkers();
+
+    // With recovery off, only the interrupted wake running again wakes the sleep, and the renewal
+    // must not have kept its lease from it.
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), {
+      timeout: WORKFLOW_RUN_LEASE_TTL_MS / 2,
+    });
+    expect(seen.executions).toEqual(['A:before', 'A:after']);
+  }, 20_000);
+
   it('stops a wake whose workers stopped while it claimed its lease', async () => {
     const storage = new InMemoryStore();
     const store = (await storage.getStore('workflows'))!;
