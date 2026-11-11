@@ -108,8 +108,18 @@ const pendingWakes = new WeakMap<LivenessScope, Set<PendingWake>>();
 const pausedWakes = new WeakMap<LivenessScope, PendingWake[]>();
 /** The processes whose workers stopped, from {@link pauseSleepWakes} until {@link resumeSleepWakes}. */
 const pausedScopes = new WeakSet<LivenessScope>();
-/** The leases of the wakes each process is running. */
-const activeWakes = new WeakMap<LivenessScope, Set<SleepWakeLease>>();
+/** A wake that holds its lease, and whether stopping the workers interrupted it. */
+interface ActiveWake {
+  lease: SleepWakeLease;
+  /**
+   * Set by {@link pauseSleepWakes} and never cleared: the workers starting again before the wake
+   * noticed must not make it look lost to another process, which would drop it.
+   */
+  interrupted: boolean;
+}
+
+/** The wakes each process is running. */
+const activeWakes = new WeakMap<LivenessScope, Set<ActiveWake>>();
 
 // Longer timer delays overflow and fire at once, so a longer sleep is timed in chunks of this.
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
@@ -142,7 +152,10 @@ export function pauseSleepWakes(scope: LivenessScope): void {
     pausedWakes.set(scope, [...(pausedWakes.get(scope) ?? []), ...pending]);
   }
 
-  activeWakes.get(scope)?.forEach(lease => lease.abandon());
+  activeWakes.get(scope)?.forEach(wake => {
+    wake.interrupted = true;
+    wake.lease.abandon();
+  });
 }
 
 /**
@@ -496,30 +509,30 @@ async function wakeSleep(args: ProcessorArgs, deps: SleepDeps, occurrence: Sleep
     return markWokenSleepFinished(args, deps, occurrence);
   }
 
-  // pauseSleepWakes abandons the leases listed here when the workers stop.
+  // pauseSleepWakes interrupts the wakes listed here when the workers stop. An interrupted wake
+  // runs again once they start.
   let active = activeWakes.get(scope);
-  if (lease) {
+  const wake: ActiveWake | undefined = lease ? { lease, interrupted: false } : undefined;
+  if (wake) {
     if (!active) {
       active = new Set();
       activeWakes.set(scope, active);
     }
 
-    active.add(lease);
+    active.add(wake);
     // The workers stopped while the claim was on its way, after pauseSleepWakes went through the list.
     if (pausedScopes.has(scope)) {
-      lease.abandon();
+      wake.interrupted = true;
+      wake.lease.abandon();
     }
   }
 
-  // Set when stopping the workers stopped this wake, which then runs again once they start.
-  let interrupted = false;
   // A lease that lapsed while this wake waited on the store may already be another wake's.
   const lost = async () => {
     if (!lease || (await lease.held())) {
       return false;
     }
 
-    interrupted = pausedScopes.has(scope);
     logger?.debug('Lost the lease of a workflow sleep while waking it', { workflowId, runId, stepId });
     return true;
   };
@@ -624,14 +637,14 @@ async function wakeSleep(args: ProcessorArgs, deps: SleepDeps, occurrence: Sleep
       throw error;
     }
   } finally {
-    if (lease) {
-      active?.delete(lease);
+    if (wake) {
+      active?.delete(wake);
     }
 
     // Released only after a publish: the released lease marks the occurrence woken.
     if (published) {
       await lease?.release();
-    } else if (lease && interrupted) {
+    } else if (lease && wake?.interrupted) {
       // The timer that started this wake is gone, so the wake is kept for resumeSleepWakes. Its own
       // lease would hold the next attempt off for a lease TTL.
       await lease.lapse();

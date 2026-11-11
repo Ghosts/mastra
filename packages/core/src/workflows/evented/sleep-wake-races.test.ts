@@ -434,6 +434,52 @@ describe('waking an evented sleep once (#30012)', () => {
     expect(await storedSleeps(storage, run.runId)).toEqual(['waiting']);
   }, 20_000);
 
+  it('wakes a sleep whose workers stopped and started again while its wake checked its lease', async () => {
+    const storage = new InMemoryStore();
+    const store = (await storage.getStore('workflows'))!;
+    const seen = observe('leased');
+    const a = await startReplica(storage, sleepingFor(100)(seen.reporter('A')), {
+      pubsub: seen.pubsub('A'),
+      recovery: { workflows: 'off' },
+    });
+    const run = await a.workflow.createRun();
+
+    // A's wake marked the sleep finished and checks its lease before publishing. The store answers
+    // only once A's workers stopped and started again.
+    const claim = store.claimRunOwnership.bind(store);
+    const renew = store.renewRunOwnership.bind(store);
+    const checking = Promise.withResolvers<void>();
+    const restarted = Promise.withResolvers<void>();
+    let wakeKey: string | undefined;
+    vi.spyOn(store, 'claimRunOwnership').mockImplementation(async args => {
+      const result = await claim(args);
+      if (result.acquired && isSleepKeyOf(args.runId, run.runId)) {
+        wakeKey = args.runId;
+      }
+
+      return result;
+    });
+    vi.spyOn(store, 'renewRunOwnership').mockImplementation(async args => {
+      if (args.runId === wakeKey && (await storedSleeps(storage, run.runId))[0] === 'success') {
+        checking.resolve();
+        await restarted.promise;
+      }
+
+      return renew(args);
+    });
+    startInBackground(run, { n: 1 });
+    await checking.promise;
+    await a.mastra.stopWorkers({ drainTimeout: 0 });
+    await a.mastra.startWorkers();
+    restarted.resolve();
+
+    // With recovery off, only the interrupted wake running again wakes the sleep.
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), {
+      timeout: WORKFLOW_RUN_LEASE_TTL_MS / 2,
+    });
+    expect(seen.executions).toEqual(['A:before', 'A:after']);
+  }, 20_000);
+
   it('stops a wake whose workers stopped while it claimed its lease', async () => {
     const storage = new InMemoryStore();
     const store = (await storage.getStore('workflows'))!;
