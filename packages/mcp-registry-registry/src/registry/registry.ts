@@ -10,6 +10,14 @@ import type { RegistryFile } from './types';
 export const registryData: RegistryFile = {
   registries: [
     {
+      id: 'allmcps',
+      name: 'AllMCPs',
+      description:
+        'Directory of 31,000+ MCP servers with live handshake checks on hosted servers, sandbox runs on stdio packages, and a 0-100 quality tier on every listing.',
+      url: 'https://allmcps.com/',
+      count: '31000+',
+    },
+    {
       id: 'apitracker',
       name: 'API Tracker',
       description: 'Discover the best APIs and developer resources',
