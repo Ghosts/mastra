@@ -260,34 +260,54 @@ describe('evented recovery loop (#28712)', () => {
     },
   };
 
-  it('fails a run whose step keeps failing once its retries run out, while the broker holds each retry back', async () => {
-    const storage = new InMemoryStore();
-    let attempts = 0;
-    const workflow = createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num, retryConfig: { attempts: 2 } })
-      .then(
-        createStep({
-          id: 'broken',
-          inputSchema: Num,
-          outputSchema: Num,
-          execute: async () => {
-            attempts++;
-            throw new Error('always fails');
-          },
-        }),
-      )
-      .commit();
-    // Every retry event reaches its worker two lease TTLs late.
-    const a = await startReplica(storage, workflow as unknown as Built, {
-      pubsub: delayDeliveries(carriesHandoff, WORKFLOW_RUN_LEASE_TTL_MS * 2),
-      recovery: scanning,
-    });
-    const run = await a.workflow.createRun();
-    const restarts = await recordRestarts(storage, run.runId);
+  it.each([
+    // The step lease handed to the retry is renewed meanwhile, so nothing restarts the run.
+    ['two lease TTLs', 2, false],
+    // Past the hold limit the lease lapses and the loop restarts the run, which continues from the retry.
+    ['six lease TTLs', 6, true],
+  ] as const)(
+    'fails a run whose step keeps failing once its retries run out, while the broker holds each retry back %s',
+    async (_, ttls, restarted) => {
+      const storage = new InMemoryStore();
+      let attempts = 0;
+      const workflow = createWorkflow({
+        id: 'leased',
+        inputSchema: Num,
+        outputSchema: Num,
+        retryConfig: { attempts: 2 },
+      })
+        .then(
+          createStep({
+            id: 'broken',
+            inputSchema: Num,
+            outputSchema: Num,
+            execute: async () => {
+              attempts++;
+              throw new Error('always fails');
+            },
+          }),
+        )
+        .commit();
+      // Every retry event reaches its worker late.
+      const a = await startReplica(storage, workflow as unknown as Built, {
+        pubsub: delayDeliveries(carriesHandoff, WORKFLOW_RUN_LEASE_TTL_MS * ttls),
+        recovery: scanning,
+      });
+      const run = await a.workflow.createRun();
+      const restarts = await recordRestarts(storage, run.runId);
 
-    expect((await run.start({ inputData: { n: 1 } })).status).toBe('failed');
-    expect(attempts).toBe(3);
-    expect(restarts).toEqual([]);
-  }, 20_000);
+      const result = run.start({ inputData: { n: 1 } });
+      await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('failed'), { timeout: 25_000 });
+      // Once a restart took the run over, only storage shows how it ended.
+      if (!restarted) {
+        expect((await result).status).toBe('failed');
+      }
+
+      expect(attempts).toBe(3);
+      expect(restarts.length > 0).toBe(restarted);
+    },
+    30_000,
+  );
 
   it('restarts at boot a run whose next step event died with an in-process pubsub', async () => {
     const storage = new InMemoryStore();

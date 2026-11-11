@@ -3925,6 +3925,22 @@ export class WorkflowEventProcessor extends EventProcessor {
           requestContext: withoutAuthToken(requestContext),
           completionGuard: { eventId: args.eventId! },
         });
+      } else if (stepLease !== UNLEASED_STEP && step.type !== 'foreach' && workflowsStore) {
+        // The record still shows the failed attempt running. Should the hand-off below lapse before
+        // the retry's delivery takes it, the restart that follows continues from that retry.
+        await workflowsStore.updateWorkflowResults({
+          workflowName: workflowId,
+          runId,
+          stepId: leafId,
+          result: {
+            ...omitPriorCompletionFields((stepResults?.[leafId] ?? {}) as Record<string, unknown>),
+            status: 'running',
+            payload: prevResult.status === 'success' ? prevResult.output : undefined,
+            startedAt: Date.now(),
+            metadata: { ...stepResults?.[leafId]?.metadata, retryCount: retryCount + 1 },
+          } as StepResult<any, any, any, any>,
+          requestContext: withoutAuthToken(requestContext),
+        });
       }
       if (guardStart) stepResults[leafId] = stepResult;
       // Wait `retryConfig.delay` before the next attempt, as the default
