@@ -178,17 +178,19 @@ export async function loadNestedRuns({
   store: WorkflowsStorage;
   snapshot: WorkflowRunState;
 }): Promise<StoredNestedRun[]> {
-  const visit = async (snapshot: WorkflowRunState, depth: number): Promise<StoredNestedRun[]> => {
-    if (depth >= MAX_NESTED_RUN_DEPTH) {
-      return [];
-    }
-
+  // The nested runs `snapshot` drives, each to be read into `into`, the list of its parent.
+  const drivenBy = (snapshot: WorkflowRunState, into: StoredNestedRun[]) =>
     // Nested runs are stored under the id of the step that runs them.
-    const driven = stepResultsOf(snapshot.context).flatMap(([stepId, result]) =>
-      runningNestedRunIds(result).map(runId => ({ stepId, runId })),
+    stepResultsOf(snapshot.context).flatMap(([stepId, result]) =>
+      runningNestedRunIds(result).map(runId => ({ stepId, runId, into })),
     );
-    const loaded: StoredNestedRun[] = [];
-    await forEachBounded(driven, NESTED_RUN_READ_CONCURRENCY, async ({ stepId, runId }) => {
+
+  const root: StoredNestedRun[] = [];
+  let level = drivenBy(snapshot, root);
+  // One level at a time, so the read limit holds for the whole tree rather than per parent.
+  for (let depth = 0; depth < MAX_NESTED_RUN_DEPTH && level.length > 0; depth++) {
+    const next: typeof level = [];
+    await forEachBounded(level, NESTED_RUN_READ_CONCURRENCY, async ({ stepId, runId, into }) => {
       const run = await store.getWorkflowRunById({ runId, workflowName: stepId });
       if (!run) {
         return;
@@ -196,18 +198,20 @@ export async function loadNestedRuns({
 
       const nestedSnapshot: WorkflowRunState =
         typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot;
-      loaded.push({
+      const loaded: StoredNestedRun = {
         runId,
         snapshot: nestedSnapshot,
         updatedAt: new Date(run.updatedAt).getTime(),
-        nested: await visit(nestedSnapshot, depth + 1),
-      });
+        nested: [],
+      };
+      into.push(loaded);
+      next.push(...drivenBy(nestedSnapshot, loaded.nested));
     });
 
-    return loaded;
-  };
+    level = next;
+  }
 
-  return visit(snapshot, 0);
+  return root;
 }
 
 /** Every nested run of `nested`, the deeper ones included. */
