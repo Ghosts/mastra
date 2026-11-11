@@ -245,6 +245,31 @@ async function setUpSleep(
   // `workflows` routing publish in wakeSleep is never gated: it drives execution.
   const emitStepEvents = workflow.options.emitStepEvents !== false;
   const snapshot = await workflowsStore?.loadWorkflowSnapshot({ workflowName: workflowId, runId });
+  const resumed = snapshot && !timeTravel ? sleepInProgress(snapshot, executionPath, step.id) : undefined;
+  // Once the next step moved the run on, only the delivery's own copy of the run shows the sleep.
+  const delivered = timeTravel
+    ? undefined
+    : (resumed ??
+      sleepInProgress(
+        { context: args.stepResults, activeStepsPath: args.activeStepsPath } as WorkflowRunState,
+        executionPath,
+        step.id,
+      ));
+
+  // Checked before whether the run left the sleep: a restart or a redelivery that read the run
+  // before the wake can write the sleep back as `waiting`, also after the next step moved the run
+  // on. Setting it up again would put the run back at the sleep, so only its result is fixed.
+  if (delivered && leaseStore) {
+    const wake = await leaseStore.getRunOwnership({
+      runId: sleepOccurrenceKey(runId, executionPath, delivered.startedAt),
+    });
+    // Released, the wake lease marks the occurrence woken.
+    if (wake && !wake.leaseExpiresAt) {
+      deps.logger?.debug('Dropping a delivery of a sleep that was already woken', { workflowId, runId, executionPath });
+      return markWokenSleepFinished(args, deps, delivered);
+    }
+  }
+
   // A time-travelled run whose `running` snapshots are left out stored nothing yet: the stored
   // run is still the one it travels from, so it cannot show this run past the sleep.
   const storesProgress =
@@ -259,18 +284,7 @@ async function setUpSleep(
     });
     return;
   }
-  const resumed = snapshot && !timeTravel ? sleepInProgress(snapshot, executionPath, step.id) : undefined;
-  // A sleep woken since the stored run was written (a restart or a redelivery wrote back an older
-  // read) must not be set up again: that would put the run back at the sleep.
-  if (resumed && leaseStore) {
-    const wake = await leaseStore.getRunOwnership({
-      runId: sleepOccurrenceKey(runId, executionPath, resumed.startedAt),
-    });
-    if (wake && !wake.leaseExpiresAt) {
-      deps.logger?.debug('Dropping a delivery of a sleep that was already woken', { workflowId, runId, executionPath });
-      return markWokenSleepFinished(args, deps, resumed);
-    }
-  }
+
   const stepId = resumed?.stepId ?? step.id;
   const payload = resumed ? resumed.payload : prevResult.status === 'success' ? prevResult.output : undefined;
   const startedAt = resumed?.startedAt ?? Date.now();
