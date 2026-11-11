@@ -5392,6 +5392,27 @@ export class Run<
   }
 
   /**
+   * Restarts like {@link Run.restart}, but resolves once the run is claimed
+   * and its execution started instead of when it finishes, as `startAsync()`
+   * does for `start()`. Rejects when the restart is refused
+   * (`WORKFLOW_RESTART_RUN_OWNED`) or fails before it starts; later failures
+   * are logged. The recovery sweep uses it for evented runs, which workers
+   * drive while the caller only waits for the result.
+   * @internal
+   */
+  async restartInBackground(): Promise<void> {
+    let notifyStarted!: () => void;
+    const started = new Promise<void>(resolve => {
+      notifyStarted = resolve;
+    });
+    const execution = this._restart({ onExecutionStarted: notifyStarted });
+    await Promise.race([started, execution]);
+    void execution.catch(error => {
+      this.mastra?.getLogger()?.error(`[Workflow ${this.workflowId}] Background restart failed:`, error);
+    });
+  }
+
+  /**
    * Takes the storage ownership lease for runs the boot-time recovery sweep could restart, so a
    * sweep on another replica skips this run while this process drives it. Nested runs are covered
    * by their parent's lease, and runs that never persist a `running` snapshot are never swept.
@@ -5933,6 +5954,7 @@ export class Run<
     tracingOptions,
     outputOptions,
     actor,
+    onExecutionStarted,
     ...rest
   }: {
     requestContext?: RequestContext<TRequestContext>;
@@ -5943,6 +5965,8 @@ export class Run<
       includeResumeLabels?: boolean;
     };
     actor?: ActorSignal;
+    /** Called once the run is claimed and its execution starts; not called for a finished run. */
+    onExecutionStarted?: () => void;
   } & Partial<ObservabilityContext>): Promise<WorkflowResult<TState, TInput, TOutput, TSteps, TStorageVersion>> {
     const observabilityContext = resolveObservabilityContext(rest);
     const allowedEngines = ['default', 'evented'];
@@ -6091,6 +6115,7 @@ export class Run<
 
     let result: WorkflowResult<TState, TInput, TOutput, TSteps, TStorageVersion>;
     try {
+      onExecutionStarted?.();
       result = await this.executionEngine.execute<
         TState,
         TInput,
