@@ -4495,7 +4495,11 @@ export class Mastra<
    * recovery leaves alone (see {@link isRecoveryRestartable}).
    */
   #recoveryRestartableWorkflow(workflowId: string): AnyWorkflow | undefined {
-    if (this.__hasInternalWorkflow(workflowId)) return undefined;
+    // Internal workflows are recovered by their owners (durable agents), never by the sweep.
+    if (this.__hasInternalWorkflow(workflowId)) {
+      return undefined;
+    }
+
     const workflows = Object.values((this.#workflows ?? {}) as Record<string, AnyWorkflow>);
     const workflow = workflows.find(w => w.id === workflowId);
     return workflow && isRecoveryRestartable(workflow) ? workflow : undefined;
@@ -4510,7 +4514,10 @@ export class Mastra<
    * @internal
    */
   __scheduleWorkflowRecoveryRecheck(workflowName: string, runId: string, retryAt: number): boolean {
-    if (!this.#recoveryRestartableWorkflow(workflowName)) return false;
+    if (!this.#recoveryRestartableWorkflow(workflowName)) {
+      return false;
+    }
+
     this.#scheduleWorkflowRecoveryRecheck(workflowName, runId, retryAt);
     return true;
   }
