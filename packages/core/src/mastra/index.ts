@@ -895,6 +895,9 @@ const DEFAULT_WORKFLOW_STALL_THRESHOLD_MS = 5 * 60_000;
 // Longer timer delays overflow and fire at once.
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
+/** Whether a recovery pass applies the boot pass rules to a run it inspects. */
+type BootRule = (run: WorkflowRuns['runs'][number]) => boolean;
+
 /**
  * `value` when it is a positive finite number of milliseconds, capped at the longest timer
  * delay; `fallback` otherwise.
@@ -1001,8 +1004,9 @@ export class Mastra<
   #workflowPasses = new Map<'orphaned' | 'all', Promise<Promise<void>[] | null>>();
   // Whether the config set the scan interval, rather than the default that depends on the store.
   #workflowScanIntervalSet = false;
-  // Set once this instance started its first `orphaned` recovery pass, its boot pass.
-  #workflowBootPassStarted = false;
+  // This instance's boot pass: when its first `orphaned` recovery pass started, and whether a pass
+  // has since inspected every active run.
+  #workflowBootPass?: { startedAt: number; done: boolean };
   // Runs whose unparseable stored state recovery already logged, keyed by workflow and run id.
   #unparseableRunsLogged = new Set<string>();
   // Set while the recovery loop runs; `timer` is its next tick.
@@ -4495,7 +4499,8 @@ export class Mastra<
    * (`supportsRunFencing()`): a run another process still keeps alive and a
    * run that may only be waiting for its next step are left alone. An evented
    * run in a sleep is restarted only by the instance's first such pass, its
-   * boot pass, and left alone after it. The server's boot-time call uses this
+   * boot pass, and left alone after it. When the boot pass fails to read some
+   * runs, the next pass applies its rules to the runs not written since. The server's boot-time call uses this
    * mode and joins the first pass of the recovery loop `startWorkers()`
    * started. A call made before `startWorkers()` is the boot pass itself, so
    * an instance that runs no loop still applies the boot rules once. Stores
@@ -4569,9 +4574,17 @@ export class Mastra<
     if (probed === undefined && requested === 'orphaned') return null;
     const readsOwnership = probed === true;
     const mode = readsOwnership ? requested : 'all';
-    // This instance's first `orphaned` pass is its boot pass, which the deployer's boot-time call joins.
-    const boot = mode === 'orphaned' && !this.#workflowBootPassStarted;
-    if (mode === 'orphaned') this.#workflowBootPassStarted = true;
+    // This instance's first `orphaned` pass is its boot pass, which the deployer's boot-time call
+    // joins. A boot pass that could not inspect every run leaves boot treatment to the next pass,
+    // which applies it only to runs not written since the first one started: a run this instance
+    // took up meanwhile, or that only began sleeping since, is not treated as left by a stopped one.
+    let boot: BootRule | undefined;
+    if (mode === 'orphaned' && !this.#workflowBootPass?.done) {
+      const first = !this.#workflowBootPass;
+      const bootPass = (this.#workflowBootPass ??= { startedAt: Date.now(), done: false });
+      boot = first ? () => true : run => new Date(run.updatedAt).getTime() < bootPass.startedAt;
+    }
+    const inspection = { failed: false };
     // One lookup per parent per pass: a crashed foreach leaves one nested run per item, all under
     // the same parent.
     const parentStatusOf = createNestedRunParentStatusLookup({ store: workflowsStore });
@@ -4584,16 +4597,19 @@ export class Mastra<
           if (!proceed()) return restarts;
           const recoverable = await this.#recoverableRuns(page, workflowsStore, parentStatusOf, evented);
           // A run this process is already restarting needs no read; the call still waits for it.
+          // Only an `all` pass drops the check a queued run gets when it reaches its slot.
           const runs = recoverable.filter(run => {
             if (!queue.has(run.workflowName, run.runId)) return true;
-            restarts.push(queue.enqueue(run.workflowName, run.runId));
+            restarts.push(
+              mode === 'all' ? queue.enqueue(run.workflowName, run.runId) : queue.join(run.workflowName, run.runId),
+            );
             return false;
           });
           if (runs.length === 0) continue;
           const picked =
             mode === 'all'
               ? await this.#unownedRuns(runs, evented, workflowsStore, readsOwnership)
-              : await this.#orphanedRuns(runs, evented, workflowsStore, boot);
+              : await this.#orphanedRuns(runs, evented, workflowsStore, boot, inspection);
           if (picked.length > 0) {
             this.#logger.debug(`Restarting ${picked.length} active workflow run${picked.length > 1 ? 's' : ''}`, {
               workflow: workflow.id,
@@ -4612,9 +4628,11 @@ export class Mastra<
         }
       } catch (error) {
         // A store error while listing one workflow's runs must not leave the other workflows unrecovered.
+        inspection.failed = true;
         this.#logger.error('Failed to list active workflow runs for recovery', { workflow: workflow.id, error });
       }
     }
+    if (boot && !inspection.failed) this.#workflowBootPass!.done = true;
     return restarts;
   }
 
@@ -4660,7 +4678,8 @@ export class Mastra<
     runs: WorkflowRuns['runs'],
     evented: boolean,
     workflowsStore: WorkflowsStorage,
-    boot: boolean,
+    boot: BootRule | undefined,
+    inspection: { failed: boolean } = { failed: false },
   ): Promise<WorkflowRuns['runs']> {
     const ownershipKey = evented ? runLivenessKey : (runId: string) => runId;
     const snapshots = runs.map(run => this.#parsedSnapshot(run));
@@ -4669,12 +4688,15 @@ export class Mastra<
       return [ownershipKey(run.runId), ...(evented && snapshot ? runningStepOccurrenceKeys(run.runId, snapshot) : [])];
     });
     const leases = await this.#readRunOwnerships(workflowsStore, keys, runs[0]!.workflowName);
-    if (!leases) return [];
+    if (!leases) {
+      inspection.failed = true;
+      return [];
+    }
     const picked: WorkflowRuns['runs'] = [];
     for (const [i, run] of runs.entries()) {
       const snapshot = snapshots[i];
       const orphaned = snapshot
-        ? await this.#isOrphanedRun(run, snapshot, leases, evented, workflowsStore, boot)
+        ? await this.#isOrphanedRun(run, snapshot, leases, evented, workflowsStore, boot?.(run) ?? false, inspection)
         : !leases.get(ownershipKey(run.runId))?.live;
       if (orphaned) picked.push(run);
     }
@@ -4722,7 +4744,7 @@ export class Mastra<
     runId: string,
     evented: boolean,
     workflowsStore: WorkflowsStorage,
-    boot: boolean,
+    boot: BootRule | undefined,
   ): Promise<boolean> {
     const run = await workflowsStore.getWorkflowRunById({ runId, workflowName });
     if (!run) return false;
@@ -4769,6 +4791,7 @@ export class Mastra<
     evented: boolean,
     workflowsStore: WorkflowsStorage,
     boot: boolean,
+    inspection: { failed: boolean },
   ): Promise<boolean> {
     try {
       const owner = leases.get(evented ? runLivenessKey(run.runId) : run.runId);
@@ -4804,6 +4827,7 @@ export class Mastra<
       if (owner && !hasSuspendedStep(snapshot)) return unwrittenFor >= WORKFLOW_RUN_LEASE_TTL_MS;
       return stalled;
     } catch (error) {
+      inspection.failed = true;
       this.#logger.warn('Failed to check whether a workflow run needs recovery', {
         workflow: run.workflowName,
         runId: run.runId,
@@ -4844,13 +4868,21 @@ export class Mastra<
   async #runWorkflowRecoveryTick(loop: { timer?: ReturnType<typeof setTimeout> }) {
     const running = () => this.#workflowRecoveryLoop === loop && !this.#shuttingDown;
     if (!running()) return;
-    const workflowsStore = await this.#storage?.getStore('workflows');
+    // A store that fails to initialize skips this pass only, like a failed probe.
+    let storeFailed = false;
+    const workflowsStore = await Promise.resolve()
+      .then(() => this.#storage?.getStore('workflows'))
+      .catch(error => {
+        storeFailed = true;
+        this.#logger.error('Failed to get the workflows store to check workflow runs for recovery', { error });
+        return undefined;
+      });
     const fenced = await Promise.resolve()
       .then(() => workflowsStore?.supportsRunFencing())
       .catch(() => undefined);
     // Without run ownership support no lease tells an orphaned run from a running one, so the
     // loop does nothing; the deployer's boot-time call still sweeps such a store once.
-    if (!workflowsStore || fenced === false) {
+    if ((!workflowsStore && !storeFailed) || fenced === false) {
       if (this.#workflowRecoveryLoop === loop) this.#workflowRecoveryLoop = undefined;
       return;
     }
@@ -4866,9 +4898,10 @@ export class Mastra<
       );
     }
     if (!running()) return;
-    const interval = this.#workflowScanIntervalSet
-      ? this.#recoveryConfig.workflowScanIntervalMs!
-      : DEFAULT_FULL_LISTING_SCAN_INTERVAL_MS;
+    const interval =
+      this.#workflowScanIntervalSet || !workflowsStore || workflowsStore.listsWorkflowRunsByCreatedAt()
+        ? this.#recoveryConfig.workflowScanIntervalMs!
+        : DEFAULT_FULL_LISTING_SCAN_INTERVAL_MS;
     loop.timer = setTimeout(
       () => void this.#runWorkflowRecoveryTick(loop),
       Math.min(interval * (0.8 + Math.random() * 0.4), MAX_TIMER_DELAY_MS),

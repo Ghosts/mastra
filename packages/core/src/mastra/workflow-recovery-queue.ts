@@ -48,6 +48,15 @@ export class WorkflowRecoveryQueue {
   }
 
   /**
+   * The promise of the run's queued or running restart, which settles once that restart settles,
+   * or an already settled one when the run is neither. Leaves the queued entry as it is.
+   */
+  join(workflowName: string, runId: string): Promise<void> {
+    const key = JSON.stringify([workflowName, runId]);
+    return (this.#pending.get(key) ?? this.#running.get(key))?.done ?? Promise.resolve();
+  }
+
+  /**
    * Queues a restart of the run unless it is already queued or running.
    * Returns a promise that settles once that restart settles. Once the queue
    * is closed nothing is queued and the promise is already settled.

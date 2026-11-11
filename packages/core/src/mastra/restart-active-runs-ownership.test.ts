@@ -264,6 +264,8 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
 
     const pass = replica.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
     await first.promise;
+    // A later pass, as the next tick of the recovery loop runs, finds the run still queued.
+    const later = replica.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
     const restarted = runs.find(orphaned => orphaned.run.runId === executions[0])!;
     const waiting = runs.find(orphaned => orphaned !== restarted)!;
     // While the first restart holds the only slot, the second run's owner resumes it: it writes
@@ -287,7 +289,7 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
     });
 
     finishFirst.resolve();
-    await pass;
+    await Promise.all([pass, later]);
     expect(executions).toEqual([restarted.run.runId]);
     expect(await waiting.status()).toBe('running');
   }, 15_000);
@@ -315,6 +317,34 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
 
     await expect.poll(status, { timeout: 5_000 }).toBe('success');
     expect(failures).toBe(1);
+    expect(executions).toEqual([run.runId]);
+  }, 15_000);
+
+  it('keeps recovering after a tick of the recovery loop fails to get the workflows store', async () => {
+    const storage = new InMemoryStore();
+    const executions: string[] = [];
+    const replica = buildReplica(storage, async runId => void executions.push(runId), scanning);
+    replicas.push(replica);
+    await replica.startWorkers();
+    const { run, status } = await persistOrphanedRun(storage, replica, 300);
+
+    // The store fails to come up for a few ticks, while the run's lease lapses.
+    const mastraStorage = replica.getStorage()!;
+    const getStore = mastraStorage.getStore.bind(mastraStorage);
+    let failing = true;
+    let failures = 0;
+    vi.spyOn(mastraStorage, 'getStore').mockImplementation((async (domain: 'workflows') => {
+      if (failing) {
+        failures++;
+        throw new Error('store unavailable');
+      }
+      return getStore(domain);
+    }) as typeof mastraStorage.getStore);
+    await new Promise(resolve => setTimeout(resolve, 400));
+    failing = false;
+    expect(failures).toBeGreaterThan(0);
+
+    await expect.poll(status, { timeout: 5_000 }).toBe('success');
     expect(executions).toEqual([run.runId]);
   }, 15_000);
 

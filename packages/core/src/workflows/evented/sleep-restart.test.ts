@@ -150,6 +150,52 @@ describe('evented workflow durable sleep recovery', () => {
     },
   );
 
+  it.each(['listWorkflowRuns', 'getRunOwnerships'] as const)(
+    'replays a sleeping path on the next pass when %s failed during the boot pass',
+    async method => {
+      const storage = new MockStore();
+      const afterSleep = vi.fn(async ({ inputData }: { inputData: { value: string } }) => inputData);
+      const workflow = createSleepingWorkflow({
+        id: 'sleep-boot-retry-workflow',
+        duration: 5_000,
+        beforeSleep: async () => ({ value: 'persist me' }),
+        afterSleep,
+      });
+      const workflowsStore = (await startSleepingRun({ storage, workflow, runId: 'sleep-boot-retry-run' }))!;
+      const status = async () =>
+        (await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId: 'sleep-boot-retry-run' }))
+          ?.status;
+      // Only the recovery pass's first read of the run fails.
+      const read = workflowsStore[method].bind(workflowsStore) as (args: unknown) => Promise<unknown>;
+      let failed = false;
+      vi.spyOn(workflowsStore, method).mockImplementation((async (args: Record<string, unknown>) => {
+        const ofRun =
+          args.workflowName === workflow.id ||
+          (args.runIds as string[] | undefined)?.includes(runLivenessKey('sleep-boot-retry-run'));
+        if (ofRun && !failed) {
+          failed = true;
+          throw new Error('store unavailable');
+        }
+        return read(args);
+      }) as any);
+      // The sleep rule only decides on a pubsub whose messages outlive their process.
+      const replacementRuntime = new Mastra({
+        logger: false,
+        storage,
+        pubsub: new BrokerLikePubSub(),
+        workflows: { [workflow.id]: workflow },
+      });
+      await replacementRuntime.startWorkers();
+      await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
+      expect(await status()).toBe('running');
+
+      await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
+      await vi.waitFor(async () => expect(await status()).toBe('success'), { timeout: 10_000 });
+      expect(afterSleep).toHaveBeenCalledTimes(1);
+      await replacementRuntime.stopWorkers();
+    },
+  );
+
   it.each(pubsubs)('replays a sleepUntil path after restart, with %s', async (_, pubsub) => {
     const storage = new MockStore();
     const beforeSleep = vi.fn(async () => ({ value: 'persist me' }));
