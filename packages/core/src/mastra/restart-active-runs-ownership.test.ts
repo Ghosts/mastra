@@ -251,6 +251,80 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
     15_000,
   );
 
+  /** A parent run suspended in its nested `child` workflow, and the nested run's id. */
+  async function suspendedInChild(storage: InMemoryStore, executions: string[]) {
+    const child = createWorkflow({ id: 'child', inputSchema: z.object({}), outputSchema: z.object({}) })
+      .then(
+        createStep({
+          id: 'approve',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+          resumeSchema: z.object({ approved: z.boolean() }),
+          execute: async ({ resumeData, suspend }) => {
+            executions.push(`approve:${resumeData ? 'resumed' : 'suspended'}`);
+            if (!resumeData) return suspend({});
+            return {};
+          },
+        }),
+      )
+      .commit();
+    const parent = createWorkflow({ id: 'parent', inputSchema: z.object({}), outputSchema: z.any() })
+      .then(child)
+      .then(
+        createStep({
+          id: 'after',
+          inputSchema: z.any(),
+          outputSchema: z.object({}),
+          execute: async () => {
+            executions.push('after');
+            return {};
+          },
+        }),
+      )
+      .commit();
+    const mastra = new Mastra({ logger: false, storage, workflows: { parent, child } });
+    replicas.push(mastra);
+    const run = await parent.createRun();
+    expect((await run.start({ inputData: {} })).status).toBe('suspended');
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const parentSnapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: 'parent', runId: run.runId });
+    const nestedRunId = (parentSnapshot?.context.child as { suspendPayload?: any }).suspendPayload?.__workflow_meta
+      ?.runId as string;
+    const resume = async () =>
+      (await child.createRun({ runId: nestedRunId })).resume({ step: 'approve', resumeData: { approved: true } });
+    return { run, workflowsStore, resume };
+  }
+
+  it('hands the parent lease a directly resumed nested run held over to the parent, without releasing it in between', async () => {
+    const storage = new InMemoryStore();
+    const executions: string[] = [];
+    const { run, workflowsStore, resume } = await suspendedInChild(storage, executions);
+    const claims = vi.spyOn(workflowsStore, 'claimRunOwnership');
+
+    expect((await resume()).status).toBe('success');
+    await vi.waitFor(async () =>
+      expect(await workflowsStore.loadWorkflowRunStatus({ workflowName: 'parent', runId: run.runId })).toBe('success'),
+    );
+    expect(executions).toEqual(['approve:suspended', 'approve:resumed', 'after']);
+    // The parent's lease was claimed once, by the nested run's resume, and the parent ran under it.
+    expect(claims.mock.calls.filter(([args]) => args.runId === run.runId)).toHaveLength(1);
+  });
+
+  it('fails a direct resume of a nested run whose parent lease cannot be claimed, and leaves the parent suspended', async () => {
+    const storage = new InMemoryStore();
+    const executions: string[] = [];
+    const { run, workflowsStore, resume } = await suspendedInChild(storage, executions);
+    const claim = workflowsStore.claimRunOwnership.bind(workflowsStore);
+    vi.spyOn(workflowsStore, 'claimRunOwnership').mockImplementation(async args => {
+      if (args.runId === run.runId) throw new Error('store unavailable');
+      return claim(args);
+    });
+
+    await expect(resume()).rejects.toThrow('store unavailable');
+    expect(executions).toEqual(['approve:suspended']);
+    expect(await workflowsStore.loadWorkflowRunStatus({ workflowName: 'parent', runId: run.runId })).toBe('suspended');
+  });
+
   it('does not restart a queued run that its owner took up again while it waited for a recovery slot', async () => {
     const storage = new InMemoryStore();
     const executions: string[] = [];
