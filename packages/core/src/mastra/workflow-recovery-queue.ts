@@ -3,6 +3,8 @@ import { normalizeConcurrency } from './run-with-concurrency';
 interface QueuedRecovery {
   workflowName: string;
   runId: string;
+  /** Checked when the run gets its slot; a run it finds no longer orphaned is not restarted. */
+  stillOrphaned?: () => Promise<boolean>;
   /** Settles once the run's restart settled, or once the entry was dropped before it started. */
   done: Promise<void>;
   settle: () => void;
@@ -13,7 +15,8 @@ interface QueuedRecovery {
  * most `limit` restarts run at a time; the others wait in the order they were
  * queued. A run is queued once until its restart settles, however many
  * recovery passes find it meanwhile, so one process never recovers a run
- * twice at the same time.
+ * twice at the same time, and the queue never holds more entries than there
+ * are active runs.
  */
 export class WorkflowRecoveryQueue {
   readonly #limit: number;
@@ -24,8 +27,9 @@ export class WorkflowRecoveryQueue {
   #closed = false;
 
   /**
-   * `restart` restarts one run. A restart that throws or rejects is reported to `onError` and
-   * frees its slot, so it never rejects `enqueue()` for that run or the runs around it.
+   * `restart` restarts one run. A restart, or a `stillOrphaned` check, that throws or rejects is
+   * reported to `onError` and frees its slot, so it never rejects `enqueue()` for that run or the
+   * runs around it.
    */
   constructor(
     limit: number | undefined,
@@ -47,15 +51,24 @@ export class WorkflowRecoveryQueue {
    * Queues a restart of the run unless it is already queued or running.
    * Returns a promise that settles once that restart settles. Once the queue
    * is closed nothing is queued and the promise is already settled.
+   *
+   * `stillOrphaned` runs when the run gets its slot, since a run can wait for
+   * one long enough to recover, move into a sleep or finish. A run queued
+   * again without it while it waits is restarted without the check.
    */
-  enqueue(workflowName: string, runId: string): Promise<void> {
+  enqueue(workflowName: string, runId: string, stillOrphaned?: () => Promise<boolean>): Promise<void> {
     const key = JSON.stringify([workflowName, runId]);
-    const existing = this.#pending.get(key) ?? this.#running.get(key);
-    if (existing) return existing.done;
+    const pending = this.#pending.get(key);
+    if (pending) {
+      if (!stillOrphaned) pending.stillOrphaned = undefined;
+      return pending.done;
+    }
+    const running = this.#running.get(key);
+    if (running) return running.done;
     if (this.#closed) return Promise.resolve();
     let settle!: () => void;
     const done = new Promise<void>(resolve => (settle = resolve));
-    this.#pending.set(key, { workflowName, runId, done, settle });
+    this.#pending.set(key, { workflowName, runId, stillOrphaned, done, settle });
     this.#startNext();
     return done;
   }
@@ -67,6 +80,15 @@ export class WorkflowRecoveryQueue {
     this.#pending.clear();
   }
 
+  /** Accepts runs again after {@link close}. */
+  open(): void {
+    this.#closed = false;
+  }
+
+  /**
+   * Starts the oldest waiting runs while slots are free. Each frees its slot
+   * and starts the next once its restart settles, however it settles.
+   */
   #startNext(): void {
     while (this.#running.size < this.#limit) {
       const next = this.#pending.entries().next();
@@ -76,8 +98,17 @@ export class WorkflowRecoveryQueue {
       this.#running.set(key, entry);
       const run = { workflowName: entry.workflowName, runId: entry.runId };
       void Promise.resolve()
-        .then(() => this.#restart(run.workflowName, run.runId))
-        .catch(error => this.#onError(error, run))
+        .then(async () => {
+          if (entry.stillOrphaned && !(await entry.stillOrphaned())) return;
+          await this.#restart(run.workflowName, run.runId);
+        })
+        .catch(error => {
+          try {
+            this.#onError(error, run);
+          } catch {
+            // A failing error report must not keep the slot or stop the queue.
+          }
+        })
         .finally(() => {
           this.#running.delete(key);
           entry.settle();

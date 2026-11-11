@@ -96,7 +96,7 @@ describe('evented workflow durable sleep recovery', () => {
       workflows: { [workflow.id]: workflow },
     });
     await replacementRuntime.startWorkers();
-    await replacementRuntime.restartAllActiveWorkflowRuns();
+    await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'all' });
 
     // The sweep returns once the restart is handed to the workers; the replayed sleep still runs out.
     await vi.waitFor(
@@ -134,7 +134,7 @@ describe('evented workflow durable sleep recovery', () => {
       workflows: { [workflow.id]: workflow },
     });
     await replacementRuntime.startWorkers();
-    await replacementRuntime.restartAllActiveWorkflowRuns();
+    await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'all' });
 
     await vi.waitFor(
       async () => {
@@ -172,7 +172,7 @@ describe('evented workflow durable sleep recovery', () => {
       workflows: { [workflow.id]: workflow },
     });
     await replacementRuntime.startWorkers();
-    await replacementRuntime.restartAllActiveWorkflowRuns();
+    await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'all' });
 
     expect(createRun).not.toHaveBeenCalled();
     const snapshot = await workflowsStore?.loadWorkflowSnapshot({

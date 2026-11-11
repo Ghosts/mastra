@@ -1,8 +1,13 @@
 /**
  * Boot-time workflow recovery must not re-drive a run another live replica is
  * executing (issue #25579). Two Mastra instances share one store, the way two
- * replicas share one database.
+ * replicas share one database. Leases use a short TTL here, read when core
+ * loads, so the recovery loop's grace after a lapsed lease passes within a test.
  */
+vi.hoisted(() => {
+  process.env.MASTRA_AGENT_THREAD_LEASE_TTL_MS = '600';
+});
+
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { InMemoryStore } from '../storage/mock';
@@ -14,6 +19,10 @@ import type { MastraRecoveryConfig } from './index';
 /** Recovery loop settings that let a tick find an orphaned run within a test. */
 const scanning: MastraRecoveryConfig = { workflowScanIntervalMs: 100 };
 
+/**
+ * A replica whose `workflow` (`recoverable-wf`) runs one default-engine step that calls
+ * `onExecute` with the run id.
+ */
 function buildReplica(
   storage: InMemoryStore,
   onExecute: (runId: string) => Promise<void>,
@@ -45,6 +54,10 @@ afterEach(async () => {
   await Promise.all(replicas.splice(0).map(mastra => mastra.shutdown()));
 });
 
+/**
+ * Stores a `running` run of `mastra`'s workflow with a run lease that lapses after `leaseMs`, as a
+ * replica that crashed mid-run leaves it, and returns a reader of the run's stored status.
+ */
 async function persistOrphanedRun(storage: InMemoryStore, mastra: Mastra, leaseMs: number) {
   const workflow = mastra.getWorkflow('workflow');
   const run = await workflow.createRun();
@@ -115,7 +128,117 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
 
     await expect.poll(status, { timeout: 5_000 }).toBe('success');
     expect(executions.map(e => e.runId)).toEqual([run.runId]);
-    expect(executions[0]!.at).toBeGreaterThanOrEqual(leaseExpiresAt);
+    // One lease TTL of grace after the lease lapsed, for an owner that only paused.
+    expect(executions[0]!.at).toBeGreaterThanOrEqual(leaseExpiresAt + WORKFLOW_RUN_LEASE_TTL_MS);
+  }, 15_000);
+
+  it("leaves a run to its owner while the owner's renewals pause past the lease TTL, as when its event loop blocks", async () => {
+    const storage = new InMemoryStore();
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const executions: string[] = [];
+    const resume = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    const owner = buildReplica(storage, async runId => {
+      executions.push(`A:${runId}`);
+      started.resolve();
+      await resume.promise;
+    });
+    const other = buildReplica(storage, async runId => void executions.push(`B:${runId}`), scanning);
+    replicas.push(owner, other);
+    await other.startWorkers();
+    const run = await owner.getWorkflow('workflow').createRun();
+    const result = run.start({ inputData: {} });
+    await started.promise;
+
+    // A renews nothing for 1.5 TTLs: its lease lapses half a TTL before it renews again.
+    const renew = workflowsStore.renewRunOwnership.bind(workflowsStore);
+    let paused = true;
+    vi.spyOn(workflowsStore, 'renewRunOwnership').mockImplementation(async args => {
+      if (paused && args.runId === run.runId) throw new Error('renewal did not run');
+      return renew(args);
+    });
+    const listings = vi.spyOn(workflowsStore, 'listWorkflowRuns');
+    await new Promise(resolve => setTimeout(resolve, WORKFLOW_RUN_LEASE_TTL_MS * 1.5));
+    paused = false;
+    await vi.waitFor(async () => expect((await workflowsStore.getRunOwnership({ runId: run.runId }))?.live).toBe(true));
+
+    // B ticked through the lapse without restarting the run.
+    expect(listings.mock.calls.length).toBeGreaterThanOrEqual(3);
+    resume.resolve();
+    expect((await result).status).toBe('success');
+    expect(executions).toEqual([`A:${run.runId}`]);
+  }, 15_000);
+
+  it('leaves a parent run alone while one of its nested runs is resumed directly', async () => {
+    const storage = new InMemoryStore();
+    const executions: string[] = [];
+    const resumed = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const build = (replica: string) => {
+      const child = createWorkflow({ id: 'child', inputSchema: z.object({}), outputSchema: z.object({}) })
+        .then(
+          createStep({
+            id: 'approve',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            resumeSchema: z.object({ approved: z.boolean() }),
+            execute: async ({ resumeData, suspend }) => {
+              executions.push(`${replica}:approve:${resumeData ? 'resumed' : 'suspended'}`);
+              if (!resumeData) return suspend({});
+              resumed.resolve();
+              await finish.promise;
+              return {};
+            },
+          }),
+        )
+        .commit();
+      const parent = createWorkflow({ id: 'parent', inputSchema: z.object({}), outputSchema: z.any() })
+        .then(child)
+        .then(
+          createStep({
+            id: 'after',
+            inputSchema: z.any(),
+            outputSchema: z.object({}),
+            execute: async () => {
+              executions.push(`${replica}:after`);
+              return {};
+            },
+          }),
+        )
+        .commit();
+      return { parent, child };
+    };
+    const onA = build('A');
+    const onB = build('B');
+    const a = new Mastra({ logger: false, storage, workflows: onA });
+    const b = new Mastra({ logger: false, storage, workflows: onB, recovery: scanning });
+    replicas.push(a, b);
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    const run = await onA.parent.createRun();
+    expect((await run.start({ inputData: {} })).status).toBe('suspended');
+    const parentSnapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: 'parent', runId: run.runId });
+    const nestedRunId = (parentSnapshot?.context.child as { suspendPayload?: any }).suspendPayload?.__workflow_meta
+      ?.runId as string;
+    await b.startWorkers();
+
+    // Resuming the nested run sets the parent `running`; the parent takes its lease only once the nested run finished.
+    const listings = vi.spyOn(workflowsStore, 'listWorkflowRuns');
+    const resume = (await onA.child.createRun({ runId: nestedRunId })).resume({
+      step: 'approve',
+      resumeData: { approved: true },
+    });
+    await resumed.promise;
+    expect(await workflowsStore.loadWorkflowRunStatus({ workflowName: 'parent', runId: run.runId })).toBe('running');
+    const listedAtResume = listings.mock.calls.length;
+    await new Promise(resolve => setTimeout(resolve, WORKFLOW_RUN_LEASE_TTL_MS * 3));
+    expect(listings.mock.calls.length).toBeGreaterThanOrEqual(listedAtResume + 3);
+
+    finish.resolve();
+    expect((await resume).status).toBe('success');
+    await vi.waitFor(async () =>
+      expect(await workflowsStore.loadWorkflowRunStatus({ workflowName: 'parent', runId: run.runId })).toBe('success'),
+    );
+    expect(executions).toEqual(['A:approve:suspended', 'A:approve:resumed', 'A:after']);
   }, 15_000);
 
   it('keeps recovering after a tick of the recovery loop fails to read storage', async () => {
@@ -158,11 +281,16 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
       },
       scanning,
     );
+    replicas.push(replica);
     const { workflowsStore, status } = await persistOrphanedRun(storage, replica, 100);
+    const listings = vi.spyOn(workflowsStore, 'listWorkflowRuns');
     await replica.startWorkers();
     await started.promise;
 
-    const listings = vi.spyOn(workflowsStore, 'listWorkflowRuns');
+    // The loop keeps ticking while the run it restarted is still running.
+    const listedAtRestart = listings.mock.calls.length;
+    await vi.waitFor(() => expect(listings.mock.calls.length).toBeGreaterThanOrEqual(listedAtRestart + 2));
+    expect(events).toEqual([]);
     const shutdown = replica.shutdown({ drainTimeout: 10_000 }).then(() => events.push('shut down'));
     const listedBeforeShutdown = listings.mock.calls.length;
     setTimeout(finish.resolve, 300);
@@ -196,16 +324,19 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
   it('does not keep the process alive while the recovery loop waits for its next tick', async () => {
     const replica = buildReplica(new InMemoryStore(), async () => {}, { workflowScanIntervalMs: 60_000 });
     replicas.push(replica);
-    // Unref'd timers are not active resources.
-    const timers = () => process.getActiveResourcesInfo().filter(resource => resource === 'Timeout').length;
-    const before = timers();
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
 
     await replica.startWorkers();
     // Joins the loop's first pass, after which the loop schedules its next tick.
     await replica.restartAllActiveWorkflowRuns();
     await new Promise(resolve => setImmediate(resolve));
 
-    expect(timers()).toBe(before);
+    // The next tick, 60s give or take a fifth.
+    const tick = setTimeoutSpy.mock.calls.findIndex(
+      ([, delay]) => delay !== undefined && delay >= 48_000 && delay <= 72_000,
+    );
+    expect(tick).toBeGreaterThanOrEqual(0);
+    expect((setTimeoutSpy.mock.results[tick]!.value as NodeJS.Timeout).hasRef()).toBe(false);
   });
 
   it('keeps renewing the lease of a run that outlives the lease TTL', async () => {

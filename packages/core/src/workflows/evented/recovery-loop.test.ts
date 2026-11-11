@@ -12,23 +12,29 @@ vi.hoisted(() => {
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { EventEmitterPubSub } from '../../events/event-emitter';
+import type { PubSub } from '../../events/pubsub';
+import type { Event } from '../../events/types';
+import { Mastra } from '../../mastra';
 import { InMemoryStore } from '../../storage/mock';
+import { WORKFLOW_RUN_LEASE_TTL_MS } from '../run-ownership';
 import { restartLeaseKey, runLivenessKey, stepOccurrenceKey } from './leases';
 import {
   Num,
   crash,
   interceptWorkflowEvents,
   isStepRunAt,
+  replicas,
   runStatus,
   scanning,
   shapes,
+  sleep,
   startReplica,
   stopReplicas,
   track,
   work,
 } from './test-utils/lease-replicas';
 import type { Built, Report, Store } from './test-utils/lease-replicas';
-import { createWorkflow } from '.';
+import { createStep, createWorkflow } from '.';
 
 afterEach(stopReplicas);
 
@@ -126,6 +132,145 @@ describe('evented recovery loop (#28712)', () => {
 
     await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 10_000 });
     expect(tracked.executions).toEqual(['A:a', 'B:a']);
+  }, 20_000);
+
+  /**
+   * A broker that delivers the first `workflows` event `pick` matches `ms` late, the way a busy
+   * one does. The publisher goes on meanwhile.
+   */
+  const delayFirst = (pick: (event: Event) => boolean, ms: number): PubSub => {
+    const inner = new EventEmitterPubSub();
+    let delayed = false;
+    return new Proxy(inner, {
+      get(target, prop) {
+        if (prop === 'subscribe') {
+          return (topic: string, cb: (event: Event, ...rest: any[]) => unknown, ...options: any[]) =>
+            target.subscribe(
+              topic,
+              async (event: Event, ...rest: any[]) => {
+                if (topic === 'workflows' && !delayed && pick(event)) {
+                  delayed = true;
+                  await sleep(ms);
+                }
+
+                return cb(event, ...rest);
+              },
+              ...options,
+            );
+        }
+
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  };
+  // Long enough for the run's liveness to lapse, far below the stall threshold.
+  const backlog = WORKFLOW_RUN_LEASE_TTL_MS * 4;
+
+  const delayedEvents = {
+    "a finished step's step end event": {
+      pick: (event: Event) => event.type === 'workflow.step.end',
+      build: (report: Report) => ({
+        workflow: createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num })
+          .then(work('a', report))
+          .then(work('b', report))
+          .commit(),
+        nested: {},
+      }),
+      input: { n: 1 } as unknown,
+      labels: ['a', 'b'],
+    },
+    "a nested run's next step event": {
+      pick: (event: Event) => isStepRunAt(event, [1]) && (event.data as { workflowId?: string }).workflowId === 'child',
+      build: (report: Report) => {
+        const child = createWorkflow({ id: 'child', inputSchema: Num, outputSchema: Num })
+          .then(work('c1', report))
+          .then(work('c2', report))
+          .commit();
+        return {
+          workflow: createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: z.any() }).then(child).commit(),
+          nested: { child },
+        };
+      },
+      input: { n: 1 } as unknown,
+      labels: ['c1', 'c2'],
+    },
+    "a foreach item's step event": {
+      pick: (event: Event) =>
+        isStepRunAt(event, [0, 1]) && (event.data as { workflowId?: string }).workflowId === 'leased',
+      build: (report: Report) => ({
+        workflow: createWorkflow({ id: 'leased', inputSchema: z.array(Num), outputSchema: z.any() })
+          .foreach(
+            createStep({
+              id: 'item',
+              inputSchema: Num,
+              outputSchema: Num,
+              execute: async ({ inputData }) => {
+                await report(`item:${inputData.n}`);
+                return inputData;
+              },
+            }),
+            { concurrency: 1 },
+          )
+          .commit(),
+        nested: {},
+      }),
+      input: [{ n: 1 }, { n: 2 }, { n: 3 }] as unknown,
+      labels: ['item:1', 'item:2', 'item:3'],
+    },
+  };
+
+  it.each(Object.keys(delayedEvents) as (keyof typeof delayedEvents)[])(
+    'runs each step once when the broker holds %s back for longer than the lease TTL',
+    async name => {
+      const { pick, build, input, labels } = delayedEvents[name];
+      const storage = new InMemoryStore();
+      const executions: string[] = [];
+      const { workflow, nested } = build(async label => void executions.push(label));
+      const a = await startReplica(storage, workflow as unknown as Built, {
+        pubsub: delayFirst(pick, backlog),
+        nested: nested as Record<string, Built>,
+        recovery: scanning,
+      });
+      const listings = vi.spyOn((await storage.getStore('workflows'))!, 'listWorkflowRuns');
+      const run = await a.workflow.createRun();
+      const restarts = await recordRestarts(storage, run.runId);
+
+      expect((await run.start({ inputData: input as any })).status).toBe('success');
+      // The loop ticked through the backlog while the run's liveness had lapsed, and left it alone.
+      expect(listings.mock.calls.length).toBeGreaterThanOrEqual(backlog / scanning.workflowScanIntervalMs / 2);
+      expect(restarts).toEqual([]);
+      expect(executions.sort()).toEqual([...labels].sort());
+    },
+    20_000,
+  );
+
+  it('restarts no other run when a restart() starts the workers of an instance that never called startWorkers()', async () => {
+    const storage = new InMemoryStore();
+    const tracked = track({ blocks: ['a'] }, { hangForever: true });
+    const a = await startReplica(storage, shapes.step.build(tracked.reporter('A')));
+    const left = await a.workflow.createRun();
+    const restarted = await a.workflow.createRun();
+    void left.start({ inputData: { n: 1 } });
+    void restarted.start({ inputData: { n: 2 } });
+    await vi.waitFor(() => expect(tracked.executions).toEqual(['A:a', 'A:a']));
+    await crash(a, storage, [
+      stepOccurrenceKey(left.runId, [0]),
+      runLivenessKey(left.runId),
+      stepOccurrenceKey(restarted.runId, [0]),
+      runLivenessKey(restarted.runId),
+    ]);
+
+    // A script restarts one run without starting workers; the restart starts them lazily.
+    const workflow = shapes.step.build(tracked.reporter('B'));
+    const script = new Mastra({ logger: false, storage, recovery: scanning, workflows: { leased: workflow } });
+    replicas.push(script);
+    const restarts = await recordRestarts(storage, left.runId);
+    expect((await (await workflow.createRun({ runId: restarted.runId })).restart()).status).toBe('success');
+
+    expect(tracked.executions).toEqual(['A:a', 'A:a', 'B:a']);
+    expect(restarts).toEqual([]);
+    expect(await runStatus(storage, left.runId)).toBe('running');
   }, 20_000);
 
   it('restarts a run whose next step message was lost once the run went unwritten for the stall threshold', async () => {

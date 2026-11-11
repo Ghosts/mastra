@@ -413,7 +413,10 @@ describe('evented step leases (#28712)', () => {
         await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 10_000 });
         expect(executions).toEqual(['A', 'B']);
       } else {
+        // B's loop ticks through the lapse, and past it, without restarting the run.
+        const listings = vi.spyOn((await storage.getStore('workflows'))!, 'listWorkflowRuns');
         await sleep(WORKFLOW_RUN_LEASE_TTL_MS * 3);
+        expect(listings.mock.calls.length).toBeGreaterThanOrEqual(3);
         expect(executions).toEqual(['A']);
         expect(await runStatus(storage, run.runId)).toBe('running');
       }

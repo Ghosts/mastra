@@ -109,7 +109,7 @@ describe('boot-time workflow recovery sweep (#28712)', () => {
       await persistActiveRun(storage, 'orphaned');
       const loads = await countLoads(storage);
 
-      await mastra.restartAllActiveWorkflowRuns();
+      await mastra.restartAllActiveWorkflowRuns({ mode: 'all' });
 
       await vi.waitFor(() => expect(executions).toEqual(['orphaned']));
       expect(loads.get('orphaned')).toBeGreaterThan(0);
@@ -136,7 +136,7 @@ describe('boot-time workflow recovery sweep (#28712)', () => {
     const listCalls = vi.spyOn(store, 'listWorkflowRuns');
     const ownershipReads = vi.spyOn(store, 'getRunOwnerships');
 
-    await mastra.restartAllActiveWorkflowRuns();
+    await mastra.restartAllActiveWorkflowRuns({ mode: 'all' });
 
     expect([...executions].sort()).toEqual([...orphaned].sort());
     const reads = listCalls.mock.calls.filter(([args]) => args?.workflowName === 'recovered-wf');
@@ -237,7 +237,7 @@ describe('boot-time workflow recovery sweep (#28712)', () => {
       await persistActiveRun(storage, runId);
     }
 
-    const sweep = mastra.restartAllActiveWorkflowRuns();
+    const sweep = mastra.restartAllActiveWorkflowRuns({ mode: 'all' });
 
     // With one slot, a sweep that waited for each run would still be on the first one.
     await vi.waitFor(() => expect([...started].sort()).toEqual(runIds));

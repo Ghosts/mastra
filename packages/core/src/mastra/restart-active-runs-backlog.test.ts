@@ -103,12 +103,12 @@ describe('boot-time recovery of evented runs behind a worker backlog (#28712)', 
     const executions: string[] = [];
     // B's workers only get to the restarts three lease TTLs after B published them.
     const b = await startReplica(storage, 'B', executions, backloggedPubSub(WORKFLOW_RUN_LEASE_TTL_MS * 3));
-    await b.restartAllActiveWorkflowRuns();
+    await b.restartAllActiveWorkflowRuns({ mode: 'all' });
 
     // C boots once the `restart()` leases B took would have lapsed, before B's workers start.
     await sleep(WORKFLOW_RUN_LEASE_TTL_MS * 1.5);
     const c = await startReplica(storage, 'C', executions);
-    await c.restartAllActiveWorkflowRuns();
+    await c.restartAllActiveWorkflowRuns({ mode: 'all' });
 
     await vi.waitFor(
       async () => {
@@ -126,7 +126,7 @@ describe('boot-time recovery of evented runs behind a worker backlog (#28712)', 
     await persistActiveRun(storage, 'orphaned');
     const executions: string[] = [];
     const b = await startReplica(storage, 'B', executions, backloggedPubSub('never'));
-    await b.restartAllActiveWorkflowRuns();
+    await b.restartAllActiveWorkflowRuns({ mode: 'all' });
     const restartLease = async () => (await store.getRunOwnership({ runId: restartLeaseKey('orphaned') }))?.live;
 
     // B keeps its restart lease past one TTL while it waits for a worker.
@@ -136,7 +136,7 @@ describe('boot-time recovery of evented runs behind a worker backlog (#28712)', 
     // No worker ever marks the run live, so B stops renewing and the lease lapses.
     await vi.waitFor(async () => expect(await restartLease()).toBe(false), { timeout: 10_000, interval: 100 });
     const c = await startReplica(storage, 'C', executions);
-    await c.restartAllActiveWorkflowRuns();
+    await c.restartAllActiveWorkflowRuns({ mode: 'all' });
     await vi.waitFor(() => expect(executions).toEqual(['C:orphaned']));
   }, 20_000);
 
@@ -147,7 +147,7 @@ describe('boot-time recovery of evented runs behind a worker backlog (#28712)', 
     // Every batched ownership read fails, as a timed-out chunk query would.
     vi.spyOn(store, 'getRunOwnerships').mockRejectedValue(new Error('read timed out'));
     const b = await startReplica(storage, 'B', [], backloggedPubSub('never'));
-    await b.restartAllActiveWorkflowRuns();
+    await b.restartAllActiveWorkflowRuns({ mode: 'all' });
 
     await sleep(WORKFLOW_RUN_LEASE_TTL_MS * 1.5);
     expect((await store.getRunOwnership({ runId: restartLeaseKey('orphaned') }))?.live).toBe(true);

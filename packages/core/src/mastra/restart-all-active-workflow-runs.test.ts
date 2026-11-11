@@ -70,7 +70,7 @@ describe('Mastra.restartAllActiveWorkflowRuns', () => {
     const user = await stubActiveRun(storage, userWorkflow, 'user-run-1');
     const loop = await stubActiveRun(storage, durableWorkflow, 'durable-run-1');
 
-    await mastra.restartAllActiveWorkflowRuns();
+    await mastra.restartAllActiveWorkflowRuns({ mode: 'all' });
 
     expect(user.createRun).toHaveBeenCalledTimes(1);
     expect(user.createRun).toHaveBeenCalledWith({ runId: 'user-run-1' });
@@ -104,7 +104,7 @@ describe('Mastra.restartAllActiveWorkflowRuns', () => {
     const optedOut = await stubActiveRun(storage, optedOutWorkflow, 'opted-out-run-1');
     const restarted = await stubActiveRun(storage, defaultWorkflow, 'default-run-1');
 
-    await mastra.restartAllActiveWorkflowRuns();
+    await mastra.restartAllActiveWorkflowRuns({ mode: 'all' });
 
     expect(restarted.createRun).toHaveBeenCalledTimes(1);
     expect(restarted.restart).toHaveBeenCalledTimes(1);
@@ -155,8 +155,7 @@ describe('Mastra.restartAllActiveWorkflowRuns', () => {
     });
 
     let settled = false;
-    // Awaited by every test through `sweep`, which reports a rejection there.
-    const sweep = mastra.restartAllActiveWorkflowRuns().then(() => {
+    const sweep = mastra.restartAllActiveWorkflowRuns({ mode: 'all' }).then(() => {
       settled = true;
     });
 
@@ -229,7 +228,7 @@ describe('Mastra.restartAllActiveWorkflowRuns', () => {
       return getWorkflowById(id as any);
     }) as any);
 
-    await expect(mastra.restartAllActiveWorkflowRuns()).resolves.toBeUndefined();
+    await expect(mastra.restartAllActiveWorkflowRuns({ mode: 'all' })).resolves.toBeUndefined();
     expect(live.restart).toHaveBeenCalledTimes(1);
   });
 
@@ -265,7 +264,7 @@ describe('Mastra.restartAllActiveWorkflowRuns', () => {
       };
     });
 
-    await expect(mastra.restartAllActiveWorkflowRuns()).resolves.toBeUndefined();
+    await expect(mastra.restartAllActiveWorkflowRuns({ mode: 'all' })).resolves.toBeUndefined();
     expect(live.restart).toHaveBeenCalledTimes(1);
     expect(corrupt.restart).toHaveBeenCalledTimes(1);
   });
