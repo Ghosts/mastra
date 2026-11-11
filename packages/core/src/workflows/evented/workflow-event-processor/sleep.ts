@@ -3,6 +3,7 @@ import { RequestContext } from '../../../di';
 import type { PubSub } from '../../../events';
 import type { IMastraLogger } from '../../../logger';
 import type { WorkflowsStorage } from '../../../storage/domains/workflows';
+import { WORKFLOW_RUN_LEASE_TTL_MS } from '../../run-ownership';
 import { withoutAuthToken } from '../helpers';
 import {
   claimSleepStart,
@@ -103,8 +104,15 @@ interface PendingWake {
   args: ProcessorArgs;
   deps: SleepDeps;
   occurrence: SleepOccurrence;
+  /** How many attempts of this wake failed a lease check (see {@link retryWake}). */
+  attempt: number;
+  /** When the next attempt may run at the earliest, in epoch milliseconds. */
+  notBefore: number;
   timer?: ReturnType<typeof setTimeout>;
 }
+
+// The longest wait between attempts of a wake whose lease checks keep failing.
+const MAX_WAKE_RETRY_DELAY_MS = 5 * 60_000;
 
 /** The pending wakes of the sleeps each process started or resumed. */
 const pendingWakes = new WeakMap<LivenessScope, Set<PendingWake>>();
@@ -172,7 +180,7 @@ export function resumeSleepWakes(scope: LivenessScope): void {
 
   const paused = pausedWakes.get(scope) ?? [];
   pausedWakes.delete(scope);
-  paused.forEach(wake => scheduleWake(wake.args, wake.deps, wake.occurrence));
+  paused.forEach(wake => scheduleWake(wake.args, wake.deps, wake.occurrence, wake));
 }
 
 /** Starts a `sleep` step, or resumes it when the run is already in it. See {@link startSleep}. */
@@ -374,13 +382,19 @@ async function setUpSleep(
     // failing, may have let another delivery set this sleep up, and writing now could put the run
     // back at a sleep that already woke. Leases are advisory: a setup stalled after this check
     // can still write.
-    if (start && !(await start.held())) {
+    const held = start ? await start.check() : 'held';
+    if (held === 'lost') {
       deps.logger?.debug('Dropping a sleep setup whose start lease another delivery took', {
         workflowId,
         runId,
         executionPath,
       });
       return;
+    }
+
+    // A check the store failed tells nothing: the delivery fails, and the broker delivers it again.
+    if (held === 'unknown') {
+      throw new Error('Failed to check the start lease of a workflow sleep');
     }
 
     // A cancel that finished while the duration function ran must not be undone by setting the
@@ -430,13 +444,22 @@ async function setUpSleep(
 
 /**
  * Sets the timer that calls {@link wakeSleep} at the occurrence's wake time,
- * or puts the wake aside for {@link resumeSleepWakes} while the workers of the
- * process are stopped.
+ * or at `retry.notBefore` when that is later, or puts the wake aside for
+ * {@link resumeSleepWakes} while the workers of the process are stopped.
  */
-function scheduleWake(args: ProcessorArgs, deps: SleepDeps, occurrence: SleepOccurrence) {
+function scheduleWake(
+  args: ProcessorArgs,
+  deps: SleepDeps,
+  occurrence: SleepOccurrence,
+  retry: Pick<PendingWake, 'attempt' | 'notBefore'> = { attempt: 0, notBefore: 0 },
+) {
+  const { attempt, notBefore } = retry;
   // A timer set now could publish to workers that stopped; resumeSleepWakes sets it.
   if (pausedScopes.has(deps.scope)) {
-    pausedWakes.set(deps.scope, [...(pausedWakes.get(deps.scope) ?? []), { args, deps, occurrence }]);
+    pausedWakes.set(deps.scope, [
+      ...(pausedWakes.get(deps.scope) ?? []),
+      { args, deps, occurrence, attempt, notBefore },
+    ]);
     return;
   }
 
@@ -448,12 +471,12 @@ function scheduleWake(args: ProcessorArgs, deps: SleepDeps, occurrence: SleepOcc
 
   // One timer per wake, not a repeating one: a timer capped below the wake time fires early, and
   // wakeSleep then calls this again for the rest of the wait.
-  const wake: PendingWake = { args, deps, occurrence };
+  const wake: PendingWake = { args, deps, occurrence, attempt, notBefore };
   wake.timer = setTimeout(
     () => {
       pending.delete(wake);
       // wakeSleep logs its own expected outcomes; a rejection is an unexpected store or pubsub failure.
-      void wakeSleep(args, deps, occurrence).catch(error =>
+      void wakeSleep(args, deps, occurrence, attempt).catch(error =>
         deps.logger?.error('Failed to wake a sleeping workflow run', {
           workflowId: args.workflowId,
           runId: args.runId,
@@ -462,7 +485,7 @@ function scheduleWake(args: ProcessorArgs, deps: SleepDeps, occurrence: SleepOcc
         }),
       );
     },
-    Math.min(Math.max(0, occurrence.wakeAt - Date.now()), MAX_TIMER_DELAY_MS),
+    Math.min(Math.max(0, occurrence.wakeAt - Date.now(), notBefore - Date.now()), MAX_TIMER_DELAY_MS),
   );
   pending.add(wake);
 }
@@ -550,9 +573,11 @@ function sleepInProgress(
  * marking the sleep `success` and again before publishing, and stops (putting
  * the sleep back to `waiting` if it already marked it) when the lease lapsed or
  * was abandoned meanwhile. A wake stalled past the lease TTL between that check
- * and the publish can still publish twice.
+ * and the publish can still publish twice. A check the store fails tells
+ * neither, so the wake stops the same way and tries again later (see
+ * {@link retryWake}); `attempt` counts those tries.
  */
-async function wakeSleep(args: ProcessorArgs, deps: SleepDeps, occurrence: SleepOccurrence) {
+async function wakeSleep(args: ProcessorArgs, deps: SleepDeps, occurrence: SleepOccurrence, attempt = 0) {
   const { workflow, workflowId, runId, executionPath, prevResult, requestContext } = args;
   const { pubsub, workflowsStore, leaseStore, scope, logger } = deps;
   const { stepId, payload, startedAt } = occurrence;
@@ -565,7 +590,7 @@ async function wakeSleep(args: ProcessorArgs, deps: SleepDeps, occurrence: Sleep
 
   // A timer capped below a long wake time fires early.
   if (Date.now() < occurrence.wakeAt) {
-    return scheduleWake(args, deps, occurrence);
+    return scheduleWake(args, deps, occurrence, { attempt, notBefore: 0 });
   }
 
   const key = sleepOccurrenceKey(runId, executionPath, startedAt);
@@ -599,13 +624,22 @@ async function wakeSleep(args: ProcessorArgs, deps: SleepDeps, occurrence: Sleep
     }
   }
 
+  // Set when the store failed a lease check: the lease may still be this wake's, so another
+  // process need not have taken the sleep over, and this process tries again.
+  let checkFailed = false;
   // A lease that lapsed while this wake waited on the store may already be another wake's.
   const lost = async () => {
-    if (!lease || (await lease.held())) {
+    if (!lease) {
       return false;
     }
 
-    logger?.debug('Lost the lease of a workflow sleep while waking it', { workflowId, runId, stepId });
+    const held = await lease.check();
+    if (held === 'held') {
+      return false;
+    }
+
+    checkFailed = held === 'unknown';
+    logger?.debug('Lost the lease of a workflow sleep while waking it', { workflowId, runId, stepId, held });
     return true;
   };
 
@@ -724,8 +758,26 @@ async function wakeSleep(args: ProcessorArgs, deps: SleepDeps, occurrence: Sleep
     } else {
       // Left to lapse, so another wake can claim the occurrence once this one is surely gone.
       lease?.abandon();
+      if (checkFailed) {
+        retryWake(args, deps, occurrence, attempt);
+      }
     }
   }
+}
+
+/**
+ * Tries the wake of `occurrence` again after a lease check the store failed:
+ * the timer that started it is gone, and with recovery off nothing else would
+ * wake the sleep. The next attempt waits for the lease this one abandoned to
+ * lapse, at least one lease TTL, doubling with each failed attempt up to
+ * {@link MAX_WAKE_RETRY_DELAY_MS}. It claims the lease and checks the stored
+ * run again, so a sleep another process woke meanwhile stays woken once.
+ */
+function retryWake(args: ProcessorArgs, deps: SleepDeps, occurrence: SleepOccurrence, attempt: number) {
+  const delay = Math.min(WORKFLOW_RUN_LEASE_TTL_MS * 2 ** attempt, MAX_WAKE_RETRY_DELAY_MS);
+  // The jitter keeps the wakes of sleeps that failed together from retrying together.
+  const jitter = Math.random() * (WORKFLOW_RUN_LEASE_TTL_MS / 10);
+  scheduleWake(args, deps, occurrence, { attempt: attempt + 1, notBefore: Date.now() + delay + jitter });
 }
 
 /**

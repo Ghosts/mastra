@@ -30,9 +30,11 @@ export interface SleepWakeLease {
   lapse(): Promise<void>;
   /**
    * Whether this process still holds the lease, checked by renewing it in the
-   * store. `false` once it was abandoned or another process took it over.
+   * store: `'lost'` once it was abandoned or another process took it over, and
+   * `'unknown'` when the store failed the renewal, which leaves the lease as it
+   * was, possibly still held.
    */
-  held(): Promise<boolean>;
+  check(): Promise<'held' | 'lost' | 'unknown'>;
 }
 
 /** Renews the lease `record` grants until it is released or abandoned. */
@@ -88,18 +90,21 @@ function holdSleepLease(
         .catch(error => logger?.warn('Failed to let the lease of a workflow sleep lapse', { key, error }));
     },
 
-    async held() {
+    async check() {
       if (abandoned) {
-        return false;
+        return 'lost';
       }
 
-      // A failed renewal reads as a lost lease: the caller then stops before writing or publishing.
-      const renewal = await store.renewRunOwnership({ ...fence, leaseMs: WORKFLOW_RUN_LEASE_TTL_MS }).catch(error => {
-        logger?.debug('Failed to check the lease of a workflow sleep', { key, error });
-        return undefined;
-      });
+      let renewed: boolean;
+      try {
+        renewed = (await store.renewRunOwnership({ ...fence, leaseMs: WORKFLOW_RUN_LEASE_TTL_MS })).renewed;
+      } catch (error) {
+        logger?.warn('Failed to check the lease of a workflow sleep', { key, error });
+        return abandoned ? 'lost' : 'unknown';
+      }
+
       // An abandon() while the renewal was on its way counts too.
-      return !abandoned && !!renewal?.renewed;
+      return !abandoned && renewed ? 'held' : 'lost';
     },
   };
 }

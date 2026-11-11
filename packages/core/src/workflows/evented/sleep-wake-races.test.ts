@@ -676,6 +676,46 @@ describe('waking an evented sleep once (#30012)', () => {
     expect(seen.executions).toEqual(['A:before']);
   }, 20_000);
 
+  it('wakes a sleep again later when the store failed its wake lease check', async () => {
+    const storage = new InMemoryStore();
+    const store = (await storage.getStore('workflows'))!;
+    const seen = observe('leased');
+    const a = await startReplica(storage, sleepingFor(100)(seen.reporter('A')), {
+      pubsub: seen.pubsub('A'),
+      recovery: { workflows: 'off' },
+    });
+    const run = await a.workflow.createRun();
+
+    // The store fails A's lease check before publishing once, as a dropped connection would.
+    const claim = store.claimRunOwnership.bind(store);
+    const renew = store.renewRunOwnership.bind(store);
+    let wakeKey: string | undefined;
+    let failed = false;
+    vi.spyOn(store, 'claimRunOwnership').mockImplementation(async args => {
+      const result = await claim(args);
+      if (result.acquired && isSleepKeyOf(args.runId, run.runId)) {
+        wakeKey = args.runId;
+      }
+
+      return result;
+    });
+    vi.spyOn(store, 'renewRunOwnership').mockImplementation(async args => {
+      if (!failed && args.runId === wakeKey && (await storedSleeps(storage, run.runId))[0] === 'success') {
+        failed = true;
+        throw new Error('connection reset');
+      }
+
+      return renew(args);
+    });
+    startInBackground(run, { n: 1 });
+
+    // With recovery off, only A trying the wake again wakes the sleep.
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 5_000 });
+    expect(failed).toBe(true);
+    expect(seen.continuations).toEqual(['A']);
+    expect(seen.executions).toEqual(['A:before', 'A:after']);
+  }, 20_000);
+
   it('stops a wake whose workers stopped while it claimed its lease', async () => {
     const storage = new InMemoryStore();
     const store = (await storage.getStore('workflows'))!;
