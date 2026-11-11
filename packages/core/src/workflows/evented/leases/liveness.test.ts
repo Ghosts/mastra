@@ -152,6 +152,28 @@ describe('with an in-process pubsub, a run whose next step event was lost while 
     20_000,
   );
 
+  it('releases a liveness key whose write took longer than a lease TTL', async () => {
+    const storage = new InMemoryStore();
+    const store = (await storage.getStore('workflows'))!;
+    const claim = store.claimRunOwnership.bind(store);
+    // The store applies each liveness write only after a lease TTL, so it holds a full TTL from then.
+    vi.spyOn(store, 'claimRunOwnership').mockImplementation(async args => {
+      if (args.runId.endsWith('::live')) {
+        await sleep(WORKFLOW_RUN_LEASE_TTL_MS * 1.1);
+      }
+
+      return claim(args);
+    });
+    const releases = vi.spyOn(store, 'releaseRunOwnership');
+    const { a, run } = await loseSecondStep(storage, track({ blocks: [] }));
+    // Let every liveness write in flight return.
+    await sleep(WORKFLOW_RUN_LEASE_TTL_MS * 1.3);
+    expect(await runIsLive(storage, run.runId)).toBe(true);
+
+    await a.mastra.shutdown({ drainTimeout: 0 });
+    expect(releases.mock.calls.map(([fence]) => fence.runId)).toContain(runLivenessKey(run.runId));
+  }, 10_000);
+
   it('does not hold up shutdown while the store does not answer the release', async () => {
     const storage = new InMemoryStore();
     const { a, run } = await loseSecondStep(storage, track({ blocks: [] }));

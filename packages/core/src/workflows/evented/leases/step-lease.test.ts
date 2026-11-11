@@ -452,4 +452,46 @@ describe('evented step leases (#28712)', () => {
     expect(await lease(stepOccurrenceKey(leasedRun.runId, [0]))).toMatchObject({ live: false });
     expect(await lease(runLivenessKey(leasedRun.runId))).toMatchObject({ live: true });
   });
+
+  it('keeps the resume data of a resumed step that fails on the record its retry starts from', async () => {
+    const storage = new InMemoryStore();
+    const retried = Promise.withResolvers<void>();
+    // The retry's delivery is lost, so the record stays as the hand-off left it.
+    const pubsub = interceptWorkflowEvents(new EventEmitterPubSub(), event =>
+      event.type === 'workflow.step.run' && (event.data as { retryCount?: number }).retryCount === 1
+        ? { divert: () => retried.resolve() }
+        : undefined,
+    );
+    const workflow = createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num, retryConfig: { attempts: 1 } })
+      .then(
+        createStep({
+          id: 'approve',
+          inputSchema: Num,
+          outputSchema: Num,
+          resumeSchema: z.object({ approved: z.boolean() }),
+          execute: async ({ resumeData, suspend }) => {
+            if (!resumeData) {
+              return suspend({ reason: 'approval' });
+            }
+
+            throw new Error('transient');
+          },
+        }),
+      )
+      .commit();
+    const a = await startReplica(storage, workflow as unknown as Built, { pubsub });
+    const run = await a.workflow.createRun();
+    expect((await run.start({ inputData: { n: 1 } })).status).toBe('suspended');
+
+    void run.resume({ step: 'approve', resumeData: { approved: true } } as any);
+    await retried.promise;
+    const store = (await storage.getStore('workflows'))!;
+    const snapshot = await store.loadWorkflowSnapshot({ workflowName: 'leased', runId: run.runId });
+    expect(snapshot?.context.approve).toMatchObject({
+      status: 'running',
+      resumePayload: { approved: true },
+      suspendPayload: { reason: 'approval' },
+      metadata: { retryCount: 1 },
+    });
+  }, 20_000);
 });

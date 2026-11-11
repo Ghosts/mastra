@@ -40,14 +40,16 @@ import { createStep, createWorkflow } from '.';
 afterEach(stopReplicas);
 
 /**
- * Holds the next `count` liveness reads of `runId` until all of them arrived,
- * then lets them read the store at once. Recovery ticks wait for their read,
- * so the held reads come from the ticks of `count` different replicas.
+ * Holds the next `count` liveness reads of `runId` until all of them arrived and `until`
+ * settled, then lets them read the store at once. Recovery ticks wait for their read, so the held
+ * reads come from the ticks of `count` different replicas, and all of them see the store as
+ * `until` left it.
  */
-async function readLivenessTogether(storage: Store, runId: string, count: number) {
+async function readLivenessTogether(storage: Store, runId: string, count: number, until: Promise<unknown>) {
   const store = (await storage.getStore('workflows'))!;
   const readMany = store.getRunOwnerships.bind(store);
   const together = Promise.withResolvers<void>();
+  const released = Promise.all([together.promise, until]);
   let arrived = 0;
   vi.spyOn(store, 'getRunOwnerships').mockImplementation(async args => {
     if (arrived < count && args.runIds.includes(runLivenessKey(runId))) {
@@ -56,12 +58,11 @@ async function readLivenessTogether(storage: Store, runId: string, count: number
         together.resolve();
       }
 
-      await together.promise;
+      await released;
     }
 
     return readMany(args);
   });
-  return together.promise;
 }
 
 describe('evented recovery loop (#28712)', () => {
@@ -82,12 +83,15 @@ describe('evented recovery loop (#28712)', () => {
       void run.start({ inputData: shape.input as any });
       await tracked.allBlocked;
 
+      // Installed before the crash, so no tick of B or C restarts the run before both read it.
+      const restarts = await recordRestarts(storage, run.runId);
+      const crashed = Promise.withResolvers<void>();
+      await readLivenessTogether(storage, run.runId, 2, crashed.promise);
       await crash(a, storage, [
         ...shape.running.map(path => stepOccurrenceKey(run.runId, path, iteration)),
         runLivenessKey(run.runId),
       ]);
-      const restarts = await recordRestarts(storage, run.runId);
-      await readLivenessTogether(storage, run.runId, 2);
+      crashed.resolve();
 
       await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 10_000 });
       // Both replicas found the run orphaned; the restart lease let one of them restart it.

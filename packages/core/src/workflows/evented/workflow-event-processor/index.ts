@@ -3930,19 +3930,30 @@ export class WorkflowEventProcessor extends EventProcessor {
         // the retry's delivery takes it, the restart that follows continues from that retry. A
         // store that guards step starts keeps the saved failed attempt instead, even on a
         // redelivery that found it saved: the retry's start guard claims the step from it. The
-        // event's copy holds all the start wrote: nested workflow steps, whose start also records
-        // authorization metadata, return before this.
+        // event's copy holds all the start wrote, except for a resumed step: its start kept the
+        // suspend and resume data on the stored record, which a restart re-enters the step with.
+        // Nested workflow steps, whose start also records authorization metadata, return before this.
+        const resumed = resumeSteps?.[0] === leafId;
+        const stored = resumed
+          ? (await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId }))?.context[leafId]
+          : undefined;
+        const attempt: Record<string, unknown> & { metadata?: Record<string, unknown> } =
+          stored?.status === 'running'
+            ? { ...stored, startedAt: Date.now() }
+            : {
+                ...omitPriorCompletionFields((stepResults?.[leafId] ?? {}) as Record<string, unknown>),
+                status: 'running',
+                payload: prevResult.status === 'success' ? prevResult.output : undefined,
+                startedAt: Date.now(),
+              };
         await workflowsStore.updateWorkflowResults({
           workflowName: workflowId,
           runId,
           stepId: leafId,
           result: {
-            ...omitPriorCompletionFields((stepResults?.[leafId] ?? {}) as Record<string, unknown>),
-            status: 'running',
-            payload: prevResult.status === 'success' ? prevResult.output : undefined,
-            startedAt: Date.now(),
-            metadata: { ...stepResults?.[leafId]?.metadata, retryCount: retryCount + 1 },
-          } as StepResult<any, any, any, any>,
+            ...attempt,
+            metadata: { ...attempt.metadata, retryCount: retryCount + 1 },
+          } as unknown as StepResult<any, any, any, any>,
           requestContext: withoutAuthToken(requestContext),
         });
       }

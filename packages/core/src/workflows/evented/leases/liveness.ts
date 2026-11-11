@@ -169,7 +169,9 @@ export class ProcessRunLiveness {
 
         if (record) {
           const fence = { runId: record.runId, ownerId: record.ownerId, generation: record.generation };
-          this.#claims.set(runId, { store, fence, writtenAt: startedAt });
+          // Dated when the write returned: a slow write still holds a full TTL from about then,
+          // which release() must not skip.
+          this.#claims.set(runId, { store, fence, writtenAt: Date.now() });
         }
       } catch (error) {
         this.logger?.warn('Failed to mark a workflow run live', { runId, error });

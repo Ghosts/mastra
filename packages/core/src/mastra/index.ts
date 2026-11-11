@@ -4899,7 +4899,7 @@ export class Mastra<
     }
     if (!running()) return;
     const interval =
-      this.#workflowScanIntervalSet || !workflowsStore || workflowsStore.listsWorkflowRunsByCreatedAt()
+      this.#workflowScanIntervalSet || !workflowsStore
         ? this.#recoveryConfig.workflowScanIntervalMs!
         : DEFAULT_FULL_LISTING_SCAN_INTERVAL_MS;
     loop.timer = setTimeout(
