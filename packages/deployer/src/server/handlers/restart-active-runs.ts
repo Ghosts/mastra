@@ -7,7 +7,9 @@ export async function restartAllActiveWorkflowRunsHandler(c: Context) {
   try {
     const mastra: Mastra = c.get('mastra');
     if (mastra.recoveryConfig?.workflows !== 'off') {
-      void mastra.restartAllActiveWorkflowRuns().catch(error => {
+      // Joins the first pass of the recovery loop the server's workers started, and leaves runs
+      // that may still be driven or only be waiting for their next step to the loop.
+      void mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' }).catch(error => {
         mastra.getLogger().error('Failed to restart active workflow runs during server startup', { error });
       });
     }

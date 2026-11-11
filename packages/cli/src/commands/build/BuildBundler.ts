@@ -91,7 +91,7 @@ export class BuildBundler extends Bundler {
     const recoveries = [];
     if (mastra.recoveryConfig?.workflows !== 'off') {
       recoveries.push(
-        mastra.restartAllActiveWorkflowRuns().catch(error => {
+        mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' }).catch(error => {
           mastra.getLogger().error('Failed to restart active workflow runs during server startup', { error });
         }),
       );

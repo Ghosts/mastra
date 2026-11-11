@@ -99,7 +99,7 @@ describe('BuildBundler', () => {
       const entry = (new BuildBundler() as any).getEntry();
 
       expect(entry).toContain("mastra.recoveryConfig?.workflows !== 'off'");
-      expect(entry).toContain('mastra.restartAllActiveWorkflowRuns()');
+      expect(entry).toContain("mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' })");
       expect(entry).toContain("mastra.recoveryConfig?.durableAgents === 'auto'");
       expect(entry).toContain('mastra.recoverAllDurableAgents()');
       expect(entry).toContain('await Promise.all(recoveries)');
