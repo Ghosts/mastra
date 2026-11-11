@@ -86,7 +86,9 @@ export type StepLeaseClaim = StepLease | 'drop' | 'defer';
  * runs. If the holder releases instead, it ran the occurrence and the delivery
  * is dropped, unless `claimAfterRelease` marks it as a new attempt of the same
  * occurrence, such as a resume of the step the holder suspended. A process
- * shutting down stops waiting and defers the delivery.
+ * shutting down stops waiting and defers the delivery. A delivery whose
+ * occurrence `finished` reports as done and passed by the run is dropped
+ * instead of waiting.
  *
  * While the lease is held the step counts toward the run's liveness key (see
  * {@link runLivenessKey}), which `scope`, the process running the step, keeps
@@ -99,6 +101,7 @@ export async function acquireStepLease({
   key,
   handoff,
   claimAfterRelease,
+  finished,
   logger,
 }: {
   scope: LivenessScope;
@@ -107,6 +110,7 @@ export async function acquireStepLease({
   key: string;
   handoff?: StepLeaseHandoff;
   claimAfterRelease: boolean;
+  finished?: () => Promise<boolean>;
   logger?: IMastraLogger;
 }): Promise<StepLeaseClaim> {
   const ownerId = globalThis.crypto.randomUUID();
@@ -136,6 +140,11 @@ export async function acquireStepLease({
 
   let result: ClaimRunOwnershipResult = await claim({ force: false });
   if (!result.acquired) {
+    // Checked once, before the first wait: the live holder then owns what follows the occurrence.
+    if (await finished?.()) {
+      return 'drop';
+    }
+
     logger?.debug('Waiting for another worker to finish or abandon a workflow step', {
       key,
       owner: result.record?.ownerId,
