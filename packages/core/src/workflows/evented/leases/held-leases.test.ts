@@ -1,7 +1,8 @@
 /**
- * The `restart()` lease a process keeps after publishing an evented restart,
- * until a worker takes the run over (#28712). Leases use a short TTL here,
- * read when core loads.
+ * The leases a process keeps renewed until a worker takes them over (#28712):
+ * the `restart()` lease after publishing an evented restart, and a step lease
+ * handed to a retry's delivery. Leases use a short TTL here, read when core
+ * loads.
  */
 vi.hoisted(() => {
   process.env.MASTRA_AGENT_THREAD_LEASE_TTL_MS = '600';
@@ -11,10 +12,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { InMemoryStore } from '../../../storage/mock';
 import type { RunOwnershipRecord } from '../../../storage/run-fencing';
 import { WORKFLOW_RUN_LEASE_TTL_MS } from '../../run-ownership';
-import { holdRestartLease } from './held-leases';
-import { restartLeaseKey, runLivenessKey } from './keys';
+import { holdHandedOffStepLease, holdRestartLease } from './held-leases';
+import { restartLeaseKey, runLivenessKey, stepOccurrenceKey } from './keys';
 
-describe('held restart leases (#28712)', () => {
+describe('held leases (#28712)', () => {
   it('starts no new liveness check while the previous one is still pending', async () => {
     vi.useFakeTimers();
     try {
@@ -145,6 +146,33 @@ describe('held restart leases (#28712)', () => {
       await vi.advanceTimersByTimeAsync(WORKFLOW_RUN_LEASE_TTL_MS * 2);
 
       expect((await store.getRunOwnership({ runId: restartLeaseKey('restarted') }))?.live).toBe(true);
+      await hold.release();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps renewing a handed-off step lease while the liveness read of a restart lease never answers', async () => {
+    vi.useFakeTimers();
+    try {
+      const store = (await new InMemoryStore().getStore('workflows'))!;
+      const claim = (runId: string, ownerId: string) =>
+        store.claimRunOwnership({ runId, ownerId, leaseMs: WORKFLOW_RUN_LEASE_TTL_MS });
+      const restart = await claim(restartLeaseKey('restarted'), 'restarter');
+      const step = (await claim(stepOccurrenceKey('retried', [0]), 'worker')).record!;
+      // The store hangs on every liveness read, which only the restart lease needs.
+      vi.spyOn(store, 'getRunOwnerships').mockReturnValue(new Promise(() => {}));
+      const hold = holdRestartLease({ store, runId: 'restarted', record: restart.record! });
+      const endHandOff = holdHandedOffStepLease({
+        scope: { __shuttingDown: false },
+        store,
+        fence: { runId: step.runId, ownerId: step.ownerId, generation: step.generation },
+      });
+
+      await vi.advanceTimersByTimeAsync(WORKFLOW_RUN_LEASE_TTL_MS * 2);
+
+      expect((await store.getRunOwnership({ runId: step.runId }))?.live).toBe(true);
+      endHandOff();
       await hold.release();
     } finally {
       vi.useRealTimers();
