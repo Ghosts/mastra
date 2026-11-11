@@ -10,7 +10,9 @@ import type { WorkflowRunOwnership } from '../../run-ownership';
 import type { WorkflowRunState } from '../../types';
 import { isQueuedForeachIteration } from '../workflow-event-processor/loop';
 import { forEachBounded } from './bounded';
+import { holdRestartLease } from './held-leases';
 import { restartLeaseKey, runLivenessKey } from './keys';
+import type { LivenessScope } from './liveness';
 
 // Reads one restart check sends at once while it walks a run's nested runs.
 const NESTED_RUN_READ_CONCURRENCY = 8;
@@ -90,15 +92,17 @@ async function findLiveRun(
  *
  * Otherwise claims the short `restart()` lease, so that of several concurrent
  * restarts only one publishes. Liveness is read first so a refused restart
- * takes no lease that would block a later one. The lease is never renewed or
- * released: the restarted steps take their own leases on the workers, and the
- * lease only has to last until they do.
+ * takes no lease that would block a later one. The lease is kept until a
+ * worker marks the run live (see {@link holdRestartLease}); after that the
+ * restarted steps hold their own leases and it is left to lapse.
  */
 export async function claimEventedRestart({
+  scope,
   store,
   runId,
   snapshot,
 }: {
+  scope?: LivenessScope;
   store: WorkflowsStorage | undefined;
   runId: string;
   snapshot: WorkflowRunState;
@@ -119,5 +123,5 @@ export async function claimEventedRestart({
     leaseMs: WORKFLOW_RUN_LEASE_TTL_MS,
     force: false,
   });
-  return claim.acquired ? unfenced : { owner: claim.record };
+  return claim.acquired ? holdRestartLease({ scope, store, runId, record: claim.record }) : { owner: claim.record };
 }
