@@ -239,7 +239,13 @@ async function buildGraph<K extends RestartKind>(options: ScenarioOptions<K>, ge
   let mastra: any;
   try {
     if (options.kind === 'workflow') {
-      mastra = new core.Mastra({ logger: false, storage, workflows: { [built.id]: built } });
+      // Scenarios restart runs themselves; a recovery pass would race them for the restored rows.
+      mastra = new core.Mastra({
+        logger: false,
+        storage,
+        workflows: { [built.id]: built },
+        recovery: { workflows: 'off' },
+      });
       if (built.engineType === 'evented') await mastra.startWorkers();
       const workflows = await mastra.getStorage()!.getStore('workflows');
       return { core, mastra, storage, workflows, generation, workflow: mastra.getWorkflowById(built.id) };
