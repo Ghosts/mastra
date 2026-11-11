@@ -982,7 +982,7 @@ export const optimizedDependenciesRoute = registerApiRoute('/optimized-dependenc
       const entry = await readFile(join(fixturePath, 'apps', 'custom', '.mastra', 'output', 'index.mjs'), 'utf-8');
 
       expect(entry).toMatch(/recoveryConfig\?\.workflows\s*!==\s*["']off["']/);
-      expect(entry).toContain('restartAllActiveWorkflowRuns()');
+      expect(entry).toMatch(/restartAllActiveWorkflowRuns\(\{\s*mode:\s*["']orphaned["']\s*\}\)/);
       expect(entry).toContain('recoverAllDurableAgents()');
     });
 
