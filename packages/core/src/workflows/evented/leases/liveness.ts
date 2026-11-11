@@ -19,6 +19,8 @@ import { runLivenessKey } from './keys';
 export interface LivenessScope {
   /** True once the process started shutting down; it stops waiting for leases then. */
   readonly __shuttingDown: boolean;
+  /** Whether the process's pubsub delivers events within this process only. */
+  readonly __inProcessPubsub?: boolean;
 }
 
 // Liveness writes one renewal tick sends at once, so a process driving many runs does not flood the store.
@@ -187,6 +189,17 @@ export class ProcessRunLiveness {
   }
 
   /**
+   * Whether a step that finishes now keeps its step lease instead of releasing it. Once this
+   * process stopped vouching for its runs, or while an in-process pubsub shuts down, the step's
+   * end event may be lost without an error: a released lease would then make a delivery waiting
+   * on it in another instance drop the occurrence as handled, while a lapsed one lets that
+   * delivery claim it and continue the run from the saved result.
+   */
+  keepsStepLeases(): boolean {
+    return !this.#vouching || (this.scope.__shuttingDown && !!this.scope.__inProcessPubsub);
+  }
+
+  /**
    * Stops vouching for this process's runs once its shutdown drained them: no liveness key is
    * written after this, so a step still running past the drain lets its run be recovered once
    * the key lapses. Until then the keys stay fresh, so no instance restarts a run this process
@@ -200,22 +213,34 @@ export class ProcessRunLiveness {
    * released runs while the shared pubsub still delivers their messages, and step leases and the
    * finished-step check keep each step from running twice.
    *
-   * Waits at most one renew interval, so a slow store cannot hold up the rest of shutdown. A key
-   * not released by then lapses as it would have without the release.
+   * Without `release` it returns at once. With it, it waits at most one renew interval, so a slow
+   * store cannot hold up the rest of shutdown; a key not released by then lapses as it would have
+   * without the release. Runs once; later calls do nothing.
    */
   async end(release: boolean): Promise<void> {
+    if (!this.#vouching) {
+      return;
+    }
+
     this.#vouching = false;
     this.#active.clear();
     this.#lastWriteAt.clear();
+
+    if (!release) {
+      // Nothing to release, so nothing to wait for: a write still in flight only keeps its key
+      // live for one more lease TTL.
+      this.#claims.clear();
+      return;
+    }
 
     // Never rejects: each release logs its own failure.
     const releasing = (async () => {
       // A write in flight lands after this, so its claim must be known before releasing.
       await Promise.allSettled([...this.#writing.values()]);
 
-      const claims = release
-        ? [...this.#claims.values()].filter(claim => Date.now() - claim.writtenAt < WORKFLOW_RUN_LEASE_TTL_MS)
-        : [];
+      const claims = [...this.#claims.values()].filter(
+        claim => Date.now() - claim.writtenAt < WORKFLOW_RUN_LEASE_TTL_MS,
+      );
       this.#claims.clear();
       await forEachBounded(claims, LIVENESS_RENEW_CONCURRENCY, async ({ store, fence }) => {
         try {
@@ -236,10 +261,9 @@ export class ProcessRunLiveness {
 
     try {
       if (await Promise.race([releasing, timedOut])) {
-        this.logger?.warn(
-          'Stopped waiting for the liveness of workflow runs to be written or released during shutdown',
-          { timeoutMs: LIVENESS_RENEW_INTERVAL_MS },
-        );
+        this.logger?.warn('Stopped waiting for the liveness of workflow runs to be released during shutdown', {
+          timeoutMs: LIVENESS_RENEW_INTERVAL_MS,
+        });
       }
     } finally {
       clearTimeout(timer);

@@ -5053,6 +5053,15 @@ export class Mastra<
   }
 
   /**
+   * Whether this instance's pubsub delivers events within this process only, so the events it
+   * publishes are lost once its workers stopped.
+   * @internal
+   */
+  get __inProcessPubsub(): boolean {
+    return this.#pubsub.__rawBus() instanceof EventEmitterPubSub;
+  }
+
+  /**
    * Re-drive every orphaned RUNNING durable-agent run across every registered
    * `DurableAgent`. Delegates to `DurableAgent.recoverActiveRuns()` on each
    * agent that supports it (default-engine durable agents only — Inngest and
@@ -8589,6 +8598,19 @@ export class Mastra<
    * `drainTimeout`.
    */
   async shutdown(options?: { drainTimeout?: number }): Promise<void> {
+    try {
+      await this.#shutdown(options);
+    } finally {
+      // A shutdown that failed before its drain finished must not keep vouching for the evented
+      // runs it drove. Ending the liveness twice changes nothing.
+      if (this.#shuttingDown) {
+        await endRunLiveness(this, { release: this.#pubsub.__rawBus() instanceof EventEmitterPubSub });
+      }
+    }
+  }
+
+  /** The teardown {@link shutdown} runs. */
+  async #shutdown(options?: { drainTimeout?: number }): Promise<void> {
     const drainTimeout = assertDrainTimeout(options?.drainTimeout ?? DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS, 'shutdown');
 
     // `drainTimeout` is a single deadline shared by every drain in this method

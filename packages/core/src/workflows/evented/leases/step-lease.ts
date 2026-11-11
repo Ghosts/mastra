@@ -253,6 +253,12 @@ async function holdStepLease({
       // The follow-up was never published, so nothing will take the held lease over.
       endHandOffHold?.();
       released = true;
+
+      // Left to lapse instead; see ProcessRunLiveness.keepsStepLeases.
+      if (processLiveness(scope, logger).keepsStepLeases()) {
+        return;
+      }
+
       try {
         await store.releaseRunOwnership(fence);
       } catch (error) {

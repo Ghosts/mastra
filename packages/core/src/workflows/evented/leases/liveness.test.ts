@@ -166,6 +166,51 @@ describe('with an in-process pubsub, a run whose next step event was lost while 
     20_000,
   );
 
+  it('continues a run whose step outlasted the drain and finished after its process stopped its workers', async () => {
+    const storage = new InMemoryStore();
+    const tracked = track({ blocks: ['first'] });
+    const a = await startReplica(storage, twoSteps(tracked.reporter('A')));
+    const run = await a.workflow.createRun();
+    void run.start({ inputData: { n: 1 } });
+    await tracked.allBlocked;
+
+    // The drain gives up on the step and the run is released. B restarts it, and B's delivery of
+    // the step waits on the lease A's step still holds.
+    await a.mastra.shutdown({ drainTimeout: 50 });
+    const leases = await recordLeases(storage);
+    const stepKey = stepOccurrenceKey(run.runId, [0]);
+    await startReplica(storage, twoSteps(tracked.reporter('B')), { recovery: scanning });
+    await leases.until(() => leases.claims.some(claim => claim.key === stepKey && !claim.acquired));
+
+    // A's step finishes now, and its step end goes nowhere. B's delivery takes the step over once
+    // A's lease lapses, well before B's restart lease would let another restart through.
+    tracked.release();
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), {
+      timeout: WORKFLOW_RUN_LEASE_TTL_MS * 2.5,
+      interval: 20,
+    });
+    // This store saves a step's result only when its end is handled, so B runs the step again.
+    // A store with step guards saves it first, and B continues from it.
+    expect(tracked.executions).toEqual(['A:first', 'B:first', 'B:second']);
+  }, 20_000);
+
+  it('stops vouching for its runs when its shutdown fails', async () => {
+    const storage = new InMemoryStore();
+    const tracked = track({ blocks: ['first'] });
+    const a = await startReplica(storage, twoSteps(tracked.reporter('A')));
+    const run = await a.workflow.createRun();
+    void run.start({ inputData: { n: 1 } });
+    await tracked.allBlocked;
+    vi.spyOn(a.mastra, 'stopWorkers').mockRejectedValue(new Error('transport stuck'));
+
+    await expect(a.mastra.shutdown({ drainTimeout: 50 })).rejects.toThrow('transport stuck');
+    const store = (await storage.getStore('workflows'))!;
+    expect(await store.getRunOwnership({ runId: runLivenessKey(run.runId) })).toMatchObject({
+      leaseExpiresAt: null,
+    });
+    tracked.release();
+  }, 10_000);
+
   it('keeps a run live while its process drains it on shutdown, so a booting instance leaves it alone', async () => {
     const storage = new InMemoryStore();
     const tracked = track({ blocks: ['first'] });
