@@ -102,48 +102,55 @@ async function startSleepingRun({
   return workflowsStore;
 }
 
+// With an in-process pubsub the boot pass restarts a run whose liveness lapsed before it checks for a
+// sleep, so only the broker-like pubsub exercises the sleep rule.
+const pubsubs = [
+  ['an in-process pubsub', () => new EventEmitterPubSub()],
+  ['a pubsub shared across processes', () => new BrokerLikePubSub()],
+] as const;
+
 describe('evented workflow durable sleep recovery', () => {
-  it.each([
-    ['an in-process pubsub', () => new EventEmitterPubSub()],
-    ['a pubsub shared across processes', () => new BrokerLikePubSub()],
-  ] as const)('replays a sleeping path after restart without rerunning completed work, with %s', async (_, pubsub) => {
-    const storage = new MockStore();
-    const beforeSleep = vi.fn(async () => ({ value: 'persist me' }));
-    const afterSleep = vi.fn(async ({ inputData }: { inputData: { value: string } }) => inputData);
-    const workflow = createSleepingWorkflow({
-      id: 'sleep-restart-workflow',
-      duration: 5_000,
-      beforeSleep,
-      afterSleep,
-    });
-    const workflowsStore = await startSleepingRun({ storage, workflow, runId: 'sleep-restart-run' });
-    const replacementRuntime = new Mastra({
-      logger: false,
-      storage,
-      pubsub: pubsub(),
-      workflows: { [workflow.id]: workflow },
-    });
-    // Boots like a server: the boot pass restarts a sleeping run whose process stopped.
-    await replacementRuntime.startWorkers();
-    await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
+  it.each(pubsubs)(
+    'replays a sleeping path after restart without rerunning completed work, with %s',
+    async (_, pubsub) => {
+      const storage = new MockStore();
+      const beforeSleep = vi.fn(async () => ({ value: 'persist me' }));
+      const afterSleep = vi.fn(async ({ inputData }: { inputData: { value: string } }) => inputData);
+      const workflow = createSleepingWorkflow({
+        id: 'sleep-restart-workflow',
+        duration: 5_000,
+        beforeSleep,
+        afterSleep,
+      });
+      const workflowsStore = await startSleepingRun({ storage, workflow, runId: 'sleep-restart-run' });
+      const replacementRuntime = new Mastra({
+        logger: false,
+        storage,
+        pubsub: pubsub(),
+        workflows: { [workflow.id]: workflow },
+      });
+      // Boots like a server: the boot pass restarts a sleeping run whose process stopped.
+      await replacementRuntime.startWorkers();
+      await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
 
-    // The sweep returns once the restart is handed to the workers; the replayed sleep still runs out.
-    await vi.waitFor(
-      async () => {
-        const snapshot = await workflowsStore?.loadWorkflowSnapshot({
-          workflowName: workflow.id,
-          runId: 'sleep-restart-run',
-        });
-        expect(snapshot?.status).toBe('success');
-      },
-      { timeout: 10_000 },
-    );
-    expect(beforeSleep).toHaveBeenCalledTimes(1);
-    expect(afterSleep).toHaveBeenCalledTimes(1);
-    await replacementRuntime.stopWorkers();
-  });
+      // The sweep returns once the restart is handed to the workers; the replayed sleep still runs out.
+      await vi.waitFor(
+        async () => {
+          const snapshot = await workflowsStore?.loadWorkflowSnapshot({
+            workflowName: workflow.id,
+            runId: 'sleep-restart-run',
+          });
+          expect(snapshot?.status).toBe('success');
+        },
+        { timeout: 10_000 },
+      );
+      expect(beforeSleep).toHaveBeenCalledTimes(1);
+      expect(afterSleep).toHaveBeenCalledTimes(1);
+      await replacementRuntime.stopWorkers();
+    },
+  );
 
-  it('replays a sleepUntil path after restart', async () => {
+  it.each(pubsubs)('replays a sleepUntil path after restart, with %s', async (_, pubsub) => {
     const storage = new MockStore();
     const beforeSleep = vi.fn(async () => ({ value: 'persist me' }));
     const afterSleep = vi.fn(async ({ inputData }: { inputData: { value: string } }) => inputData);
@@ -159,7 +166,7 @@ describe('evented workflow durable sleep recovery', () => {
     const replacementRuntime = new Mastra({
       logger: false,
       storage,
-      pubsub: new EventEmitterPubSub(),
+      pubsub: pubsub(),
       workflows: { [workflow.id]: workflow },
     });
     await replacementRuntime.startWorkers();
@@ -180,7 +187,7 @@ describe('evented workflow durable sleep recovery', () => {
     await replacementRuntime.stopWorkers();
   });
 
-  it('does not restart evented runs when autoRestartActiveRuns is false', async () => {
+  it.each(pubsubs)('does not restart evented runs when autoRestartActiveRuns is false, with %s', async (_, pubsub) => {
     const storage = new MockStore();
     const beforeSleep = vi.fn(async () => ({ value: 'persist me' }));
     const afterSleep = vi.fn(async ({ inputData }: { inputData: { value: string } }) => inputData);
@@ -197,7 +204,7 @@ describe('evented workflow durable sleep recovery', () => {
     const replacementRuntime = new Mastra({
       logger: false,
       storage,
-      pubsub: new EventEmitterPubSub(),
+      pubsub: pubsub(),
       workflows: { [workflow.id]: workflow },
     });
     await replacementRuntime.startWorkers();
