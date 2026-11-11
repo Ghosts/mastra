@@ -383,6 +383,7 @@ async function assertRecovered(
   recovered: RestartResult,
   runId: string,
   generation = 2,
+  nextRuns = 1,
 ) {
   expect(recovered.graph.workflow.engineType).toBe('evented');
   for (const done of spec.finished) {
@@ -393,8 +394,10 @@ async function assertRecovered(
   }
   if (spec.next) {
     const calls = effects.filter(effect => effect.generation === generation && effect.step === spec.next!.step);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.input).toEqual(spec.next.input);
+    expect(calls).toHaveLength(nextRuns);
+    if (nextRuns > 0) {
+      expect(calls[0]!.input).toEqual(spec.next.input);
+    }
   }
   expect(recovered.result).toMatchObject({ status: 'success', result: spec.expected });
   const snapshot = await recovered.graph.workflows.loadWorkflowSnapshot({
@@ -489,7 +492,10 @@ describe('evented restart after a saved completed entry (COR-1354)', () => {
       const before = findRow(checkpoint, original.graph.workflow.id, runId)!.snapshot;
       const after = findRow(secondCheckpoint!, original.graph.workflow.id, runId)!.snapshot;
       const recovered = await scenario.restart(secondCheckpoint!);
-      await assertRecovered(spec, effects, recovered, runId, 3);
+      // A sleep whose result and wake time were stored resumes them, so its duration function, the
+      // call these cases record, doesn't run again.
+      const resumesStoredSleep = boundary === 'successor input' && /^sleep(Until)? successor/.test(name);
+      await assertRecovered(spec, effects, recovered, runId, 3, resumesStoredSleep ? 0 : 1);
       expect(after.activePaths).toEqual(
         spec.successorPath ?? (spec.next!.step === 'reused' ? [1] : before.activePaths),
       );
