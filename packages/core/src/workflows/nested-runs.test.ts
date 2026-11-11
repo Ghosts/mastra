@@ -10,6 +10,7 @@ import { Mastra } from '../mastra';
 import { cloneRunData } from '../storage/domains/workflows/inmemory';
 import { MockStore } from '../storage/mock';
 import { createWorkflow } from './create';
+import { WORKFLOW_RUN_LEASE_TTL_MS } from './run-ownership';
 import { createStep } from './workflow';
 import type { AnyWorkflow } from './workflow';
 
@@ -33,11 +34,14 @@ function appendItem(id: string, { suspends = false, onRun }: { suspends?: boolea
   });
 }
 
-/** A dead process stops renewing its run ownership leases; let them lapse so another process can restart its runs. */
+/**
+ * A dead process stops renewing its run ownership leases; let them lapse, longer ago than the
+ * grace recovery gives a lapsed lease, so another process can restart its runs.
+ */
 async function expireRunLeases(storage: InstanceType<typeof MockStore>) {
   const store = storage.stores.workflows!;
   for (const runId of [...(store as any).db.runOwners.keys()]) {
-    await store.claimRunOwnership({ runId, ownerId: 'lapsed', leaseMs: -1, force: true });
+    await store.claimRunOwnership({ runId, ownerId: 'lapsed', leaseMs: -2 * WORKFLOW_RUN_LEASE_TTL_MS, force: true });
   }
 }
 
@@ -84,7 +88,10 @@ describe('restarting a nested run whose process died', () => {
     await vi.waitFor(() => expect(died).toBe(true));
     await expireRunLeases(storage);
 
-    await new Mastra({ logger: false, storage, workflows: build() }).restartAllActiveWorkflowRuns({ mode: 'all' });
+    // As the server boots: the run's lease lapsed, so the recovery loop's rules restart it too.
+    await new Mastra({ logger: false, storage, workflows: build() }).restartAllActiveWorkflowRuns({
+      mode: 'orphaned',
+    });
 
     expect(innerBRuns).toBe(1);
     const state = { items: ['before:0', 'inner-a:1', 'inner-b:2'] };

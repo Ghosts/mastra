@@ -2775,7 +2775,6 @@ export class WorkflowEventProcessor extends EventProcessor {
       prevResult,
       resumeData,
       parentWorkflow,
-      retryCount = 0,
       perStep,
       state,
       outputOptions,
@@ -2792,6 +2791,13 @@ export class WorkflowEventProcessor extends EventProcessor {
     // It stays a declarative entry - the step executor interprets it per kind.
     const leaf: SingleStepEntry = step.type === 'loop' || step.type === 'foreach' ? step.step : step;
     const leafId = getEntryId(leaf);
+    // A restart of an attempt that was running continues its attempt count, so a step that keeps
+    // failing still runs out of retries when its worker crashes between them.
+    const storedAttempt = stepResults?.[leafId];
+    const retryCount: number =
+      args.retryCount ??
+      (restart && storedAttempt?.status === 'running' ? storedAttempt.metadata?.retryCount : undefined) ??
+      0;
 
     if (!isExecutableStep(step)) {
       return this.errorWorkflow(
@@ -2989,16 +2995,24 @@ export class WorkflowEventProcessor extends EventProcessor {
               }
             : {}),
         };
+        // A retry records its attempt, which a restart continues from.
+        const attemptRecord =
+          retryCount > 0
+            ? {
+                ...runningRecord,
+                metadata: { ...(runningRecord.metadata as Record<string, unknown> | undefined), retryCount },
+              }
+            : runningRecord;
         // Name the new child run before it exists. Otherwise a loop leaf keeps the
         // previous iteration's finished child here until the new child starts, and a
         // restart in that gap would reuse the finished child's result.
         const runningResult =
           nestedWorkflowStep && nestedDispatch === 'start'
             ? {
-                ...runningRecord,
-                metadata: { ...(runningRecord.metadata as Record<string, unknown> | undefined), nestedRunId },
+                ...attemptRecord,
+                metadata: { ...(attemptRecord.metadata as Record<string, unknown> | undefined), nestedRunId },
               }
-            : runningRecord;
+            : attemptRecord;
         try {
           await workflowsStore.updateWorkflowResults({
             workflowName: workflowId,

@@ -107,6 +107,10 @@ import {
 } from '../workflows/dynamic';
 import {
   isRunAsleep,
+  lastWriteOf,
+  loadNestedRuns,
+  nestedRunLeaseKeys,
+  nestedRunLive,
   nestedRunStoppedMidStep,
   runLivenessKey,
   runningStepOccurrenceKeys,
@@ -696,10 +700,10 @@ export interface Config<
    * `workflows` controls whether the server calls
    * {@link Mastra.restartAllActiveWorkflowRuns} on boot, and whether
    * `startWorkers()` starts the recovery loop, which checks for orphaned runs
-   * at once and every `workflowScanIntervalMs` afterwards. Set it to `'off'` to skip both
-   * entirely (no storage queries), for example when several replicas share one
-   * database and you recover runs another way. `workflowConcurrency` caps how
-   * many runs recovery restarts at once.
+   * at once and every `workflowScanIntervalMs` afterwards. Set it to `'off'`
+   * to skip both entirely (no storage queries), for example when several
+   * replicas share one database and you recover runs another way.
+   * `workflowConcurrency` caps how many runs recovery restarts at once.
    *
    * `durableAgents` controls whether the deployer will automatically call
    * {@link Mastra.recoverAllDurableAgents} for every registered `DurableAgent`
@@ -774,8 +778,8 @@ export interface MastraRecoveryConfig {
    * Each check lists the active runs of every workflow recovery restarts.
    * Stores that page workflow runs by `createdAt` read a page at a time; the
    * others read every run of a workflow per check, so their default is
-   * 120 seconds. Only stores with run ownership support (see
-   * `supportsRunFencing()`) get the repeated checks. Values are capped at
+   * 120 seconds. On a store without run ownership support (see
+   * `supportsRunFencing()`) the loop doesn't run. Values are capped at
    * 2^31-1; use `workflows: 'off'` to turn the loop off.
    * @default 30_000
    */
@@ -786,9 +790,9 @@ export interface MastraRecoveryConfig {
    * loop restarts it. Covers a run whose next step message was lost, and an
    * evented run that waits for its next step message, which no lease reports
    * either way. A run whose process stopped mid-step is restarted sooner. The
-   * loop leaves evented runs in a `sleep()` or `sleepUntil()` step alone. Keep
-   * it above four lease TTLs: a restart that no worker took up yet keeps
-   * other instances from restarting the run for that long.
+   * loop leaves evented runs in a `sleep()` or `sleepUntil()` step alone after
+   * its first pass. Keep it above four lease TTLs: a restart that no worker
+   * took up yet keeps other instances from restarting the run for that long.
    * @default 300_000
    */
   workflowStallThresholdMs?: number;
@@ -996,6 +1000,8 @@ export class Mastra<
   #workflowPasses = new Map<'orphaned' | 'all', Promise<Promise<void>[]>>();
   // Whether the config set the scan interval, rather than the default that depends on the store.
   #workflowScanIntervalSet = false;
+  // Set once this instance started its first `orphaned` recovery pass, its boot pass.
+  #workflowBootPassStarted = false;
   // Set while the recovery loop runs; `timer` is its next tick.
   #workflowRecoveryLoop?: { timer?: ReturnType<typeof setTimeout> };
   #durableRecoveryRechecks = new Map<string, ReturnType<typeof setTimeout>>();
@@ -4475,25 +4481,31 @@ export class Mastra<
    *
    * Each workflow's active runs are listed once per status and handled in
    * batches of a hundred, each batch's leases read with one
-   * `getRunOwnerships()` call. On a store with run ownership support (`supportsRunFencing()`), a
-   * run is restarted when it is orphaned by the same rules the recovery loop
-   * applies (see `recovery.workflowStallThresholdMs`): a run another process
-   * still keeps alive, an evented run in a sleep, and a run that may only be
-   * waiting for its next step are left alone. Pass `{ mode: 'all' }` to
-   * restart every run no process keeps alive instead, as this method did
-   * before the recovery loop. Stores without run ownership support restart
-   * every active run either way. The claim `restart()` takes stays the final
-   * check, so a run another process took in between is still refused.
+   * `getRunOwnerships()` call. By default (`{ mode: 'all' }`) every active run whose liveness key
+   * or run lease no process keeps live is restarted, sleeping runs included,
+   * without waiting for a stall or a lease grace. Use it when you know no
+   * process still drives the runs, for example after an outage of every
+   * instance.
    *
-   * A call made while a pass of the same mode is in flight, such as the first
-   * pass of the recovery loop `startWorkers()` starts, waits for that pass
+   * `{ mode: 'orphaned' }` applies the rules the recovery loop applies (see
+   * `recovery.workflowStallThresholdMs`) on a store with run ownership support
+   * (`supportsRunFencing()`): a run another process still keeps alive and a
+   * run that may only be waiting for its next step are left alone. An evented
+   * run in a sleep is restarted only by the instance's first such pass, its
+   * boot pass, and left alone after it. The server's boot-time call uses this
+   * mode and joins the first pass of the recovery loop `startWorkers()`
+   * started. Stores without run ownership support restart every active run in
+   * either mode. The claim `restart()` takes stays the final check, so a run
+   * another process took in between is still refused.
+   *
+   * A call made while a pass of the same mode is in flight waits for that pass
    * instead of reading the runs a second time. A run left alone is not checked
-   * again by this call; an instance that runs workers checks it again on its
-   * recovery loop, and an instance without workers doesn't check it again.
+   * again by this call. An instance that runs workers checks it again on its
+   * recovery loop; an instance without workers doesn't check it again.
    */
   public async restartAllActiveWorkflowRuns(options: { mode?: 'orphaned' | 'all' } = {}): Promise<void> {
     if (!this.#shuttingDown) this.#workflowRecoveries.open();
-    await Promise.all(await this.#joinWorkflowRecoveryPass(options.mode ?? 'orphaned', () => !this.#shuttingDown));
+    await Promise.all(await this.#joinWorkflowRecoveryPass(options.mode ?? 'all', () => !this.#shuttingDown));
   }
 
   /**
@@ -4528,14 +4540,20 @@ export class Mastra<
       this.#logger.debug('Cannot restart active workflow runs. Mastra storage is not initialized');
       return restarts;
     }
-    const readsOwnership = await Promise.resolve()
+    const probed = await Promise.resolve()
       .then(() => workflowsStore.supportsRunFencing())
       .catch(error => {
-        // restart() probes again and decides per run, so the pass only loses its pre-check.
         this.#logger.warn('Failed to check run fencing support before restarting workflow runs', { error });
-        return false;
+        return undefined;
       });
+    // An `all` pass loses only its pre-check (restart() probes again and decides per run); an
+    // `orphaned` pass cannot tell orphaned runs from running ones and waits for the next one.
+    if (probed === undefined && requested === 'orphaned') return restarts;
+    const readsOwnership = probed === true;
     const mode = readsOwnership ? requested : 'all';
+    // This instance's first `orphaned` pass is its boot pass, which the deployer's boot-time call joins.
+    const boot = mode === 'orphaned' && !this.#workflowBootPassStarted;
+    if (mode === 'orphaned') this.#workflowBootPassStarted = true;
     // One lookup per parent per pass: a crashed foreach leaves one nested run per item, all under
     // the same parent.
     const parentStatusOf = createNestedRunParentStatusLookup({ store: workflowsStore });
@@ -4557,7 +4575,7 @@ export class Mastra<
           const picked =
             mode === 'all'
               ? await this.#unownedRuns(runs, evented, workflowsStore, readsOwnership)
-              : await this.#orphanedRuns(runs, evented, workflowsStore);
+              : await this.#orphanedRuns(runs, evented, workflowsStore, boot);
           if (picked.length > 0) {
             this.#logger.debug(`Restarting ${picked.length} active workflow run${picked.length > 1 ? 's' : ''}`, {
               workflow: workflow.id,
@@ -4569,7 +4587,7 @@ export class Mastra<
               mode === 'all'
                 ? queue.enqueue(run.workflowName, run.runId)
                 : queue.enqueue(run.workflowName, run.runId, () =>
-                    this.#stillOrphaned(run.workflowName, run.runId, evented, workflowsStore),
+                    this.#stillOrphaned(run.workflowName, run.runId, evented, workflowsStore, boot),
                   ),
             );
           }
@@ -4614,24 +4632,32 @@ export class Mastra<
    * The runs of `runs` `#isOrphanedRun` finds orphaned. Reads, in one batch, each run's
    * liveness key or run lease and, for evented runs, the leases of the steps their stored state
    * shows running. A failed read picks none: the next tick reads again.
+   *
+   * A listed run whose stored state cannot be parsed is picked unless its key is live: none of
+   * the rules can judge it, and skipping it would leave it unrecovered on every pass without a
+   * trace. `restart()` reads the run again and decides; a run that fails there is logged.
    */
   async #orphanedRuns(
     runs: WorkflowRuns['runs'],
     evented: boolean,
     workflowsStore: WorkflowsStorage,
+    boot: boolean,
   ): Promise<WorkflowRuns['runs']> {
+    const ownershipKey = evented ? runLivenessKey : (runId: string) => runId;
     const snapshots = runs.map(run => this.#parsedSnapshot(run));
     const keys = runs.flatMap((run, i) => {
-      if (!evented) return [run.runId];
       const snapshot = snapshots[i];
-      return [runLivenessKey(run.runId), ...(snapshot ? runningStepOccurrenceKeys(run.runId, snapshot) : [])];
+      return [ownershipKey(run.runId), ...(evented && snapshot ? runningStepOccurrenceKeys(run.runId, snapshot) : [])];
     });
     const leases = await this.#readRunOwnerships(workflowsStore, keys, runs[0]!.workflowName);
     if (!leases) return [];
     const picked: WorkflowRuns['runs'] = [];
     for (const [i, run] of runs.entries()) {
       const snapshot = snapshots[i];
-      if (snapshot && (await this.#isOrphanedRun(run, snapshot, leases, evented, workflowsStore))) picked.push(run);
+      const orphaned = snapshot
+        ? await this.#isOrphanedRun(run, snapshot, leases, evented, workflowsStore, boot)
+        : !leases.get(ownershipKey(run.runId))?.live;
+      if (orphaned) picked.push(run);
     }
     return picked;
   }
@@ -4671,12 +4697,14 @@ export class Mastra<
     runId: string,
     evented: boolean,
     workflowsStore: WorkflowsStorage,
+    boot: boolean,
   ): Promise<boolean> {
     const run = await workflowsStore.getWorkflowRunById({ runId, workflowName });
     if (!run) return false;
-    const status = this.#parsedSnapshot(run)?.status;
-    if (status !== 'running' && status !== 'waiting') return false;
-    return (await this.#orphanedRuns([run], evented, workflowsStore)).length > 0;
+    const snapshot = this.#parsedSnapshot(run);
+    // An unparseable run is judged as when it was listed.
+    if (snapshot && snapshot.status !== 'running' && snapshot.status !== 'waiting') return false;
+    return (await this.#orphanedRuns([run], evented, workflowsStore, boot)).length > 0;
   }
 
   /**
@@ -4684,21 +4712,28 @@ export class Mastra<
    * and, for an evented run, the leases of the steps its stored state shows running.
    *
    * - A run whose key is live is driven by another process.
-   * - An evented run in a sleep is left alone, unless one of its other steps crashed (below): it
-   *   holds no lease until its timer wakes it.
    * - An evented run with a step whose lease was never released and has lapsed lost the worker
    *   running it, and is restarted at once; so is a run whose liveness lapsed while a nested run
-   *   it drives lost the worker running one of its steps. A released step lease means the step finished and
-   *   its next event is on its way, which a busy broker can hold back for longer than a lease
-   *   lasts; that run, like one between steps, waits for the stall rule below.
+   *   it drives lost the worker running one of its steps. A released step lease means the step
+   *   finished and its next event is on its way, which a busy broker can hold back for longer
+   *   than a lease lasts; that run, like one between steps, waits for the stall rule below.
+   * - On the `boot` pass with a pubsub that lives in this process only (`EventEmitterPubSub`), an
+   *   evented run whose liveness lapsed is restarted: the messages it waited for died with the
+   *   process that published them.
+   * - Otherwise an evented run in a sleep is left alone: it holds no lease until its timer
+   *   wakes it. The instance's `boot` pass restarts it instead, since the process whose timer
+   *   would wake it may be the one that stopped; the restart replays the sleep.
    * - A default-engine run keeps its run lease from start to end. One lease TTL after its lease
    *   lapsed, its process stopped: a process that stops renewing for a moment (a blocked event
    *   loop) renews again within that grace. A released lease on a `running` run is a resume or
    *   time travel that has not taken the lease yet, or one that crashed in between; it gets the
    *   same grace from the run's last write, or the stall rule while a step is suspended (a
    *   nested run being resumed keeps its parent `running` without a lease until it finishes).
+   *   The grace compares this process's clock with the store's `leaseExpiresAt`, so a clock skew
+   *   between them shortens or lengthens it by that skew.
    * - A run restarted by none of the rules above is restarted once it has not been written for
-   *   `recovery.workflowStallThresholdMs` (an unreadable `updatedAt` never counts).
+   *   `recovery.workflowStallThresholdMs` (an unreadable `updatedAt` never counts). For an evented
+   *   run the newest write of the nested runs it drives counts too.
    */
   async #isOrphanedRun(
     run: WorkflowRuns['runs'][number],
@@ -4706,6 +4741,7 @@ export class Mastra<
     leases: Map<string, RunOwnershipRecord>,
     evented: boolean,
     workflowsStore: WorkflowsStorage,
+    boot: boolean,
   ): Promise<boolean> {
     try {
       const owner = leases.get(evented ? runLivenessKey(run.runId) : run.runId);
@@ -4717,10 +4753,21 @@ export class Mastra<
         // A crashed step is restarted even while another branch sleeps: the restart replays that
         // sleep, while deferring to it could leave the crashed branch for as long as the sleep lasts.
         if (stoppedMidStep(run.runId, snapshot, leases)) return true;
-        // A step that drives a nested run holds no lease; the nested run's own step leases tell.
-        if (owner !== undefined && (await nestedRunStoppedMidStep({ store: workflowsStore, snapshot }))) return true;
-        if (await isRunAsleep({ store: workflowsStore, snapshot })) return false;
-        return stalled;
+        // A step that drives a nested run holds no lease; the nested runs' own step leases tell.
+        const nested = await loadNestedRuns({ store: workflowsStore, snapshot });
+        const nestedLeases =
+          nested.length > 0
+            ? await workflowsStore.getRunOwnerships({ runIds: nestedRunLeaseKeys(nested) })
+            : new Map<string, RunOwnershipRecord>();
+        if (owner !== undefined && nestedRunStoppedMidStep(nested, nestedLeases)) return true;
+        // A nested run doing the run's work keeps its own liveness and writes its own row.
+        if (nestedRunLive(nested, nestedLeases)) return false;
+        // With a pubsub that lives in this process only, the messages of a run whose liveness
+        // lapsed before this instance started died with the process that published them.
+        if (boot && owner !== undefined && this.#pubsub.__rawBus() instanceof EventEmitterPubSub) return true;
+        if (isRunAsleep(snapshot, nested)) return boot;
+        const lastWrite = lastWriteOf(new Date(run.updatedAt).getTime(), nested);
+        return now - lastWrite >= this.#recoveryConfig.workflowStallThresholdMs!;
       }
       if (owner?.leaseExpiresAt) return now - owner.leaseExpiresAt.getTime() >= WORKFLOW_RUN_LEASE_TTL_MS;
       if (owner && !hasSuspendedStep(snapshot)) return unwrittenFor >= WORKFLOW_RUN_LEASE_TTL_MS;
@@ -4738,10 +4785,11 @@ export class Mastra<
   /**
    * Starts the recovery loop unless it runs, recovery is off, or this instance runs no
    * orchestration worker. Every pass, the first included, is an `orphaned` pass (see
-   * {@link restartAllActiveWorkflowRuns}), which a `restartAllActiveWorkflowRuns()` call made
-   * meanwhile, such as the deployer's at boot, joins. Each later pass runs a scan interval after
-   * the previous one ended, give or take a fifth of it, and never waits for the runs it restarts.
-   * On a store without run ownership support the loop stops after its first pass.
+   * {@link restartAllActiveWorkflowRuns}), which a `restartAllActiveWorkflowRuns({ mode:
+   * 'orphaned' })` call made meanwhile, such as the deployer's at boot, joins. Each later pass
+   * runs a scan interval after the previous one ended, give or take a fifth of it, and never
+   * waits for the runs it restarts. On a store without run ownership support the loop does
+   * nothing and stops.
    */
   #startWorkflowRecoveryLoop(): void {
     if (
@@ -4765,37 +4813,36 @@ export class Mastra<
   async #runWorkflowRecoveryTick(loop: { timer?: ReturnType<typeof setTimeout> }) {
     const running = () => this.#workflowRecoveryLoop === loop && !this.#shuttingDown;
     if (!running()) return;
-    // Tracked so shutdown() waits for a pass that may still be queueing restarts. The pass does
-    // not wait for the restarts it queued.
-    await this.#trackDurableRecovery(
-      this.#joinWorkflowRecoveryPass('orphaned', running).then(
-        () => {},
-        error => this.#logger.error('Failed to check workflow runs for recovery', { error }),
-      ),
-    );
-    if (!running()) return;
-    const interval = await this.#workflowScanInterval();
-    if (interval === undefined || !running()) {
-      if (interval === undefined) this.#workflowRecoveryLoop = undefined;
-      return;
-    }
-    loop.timer = setTimeout(() => void this.#runWorkflowRecoveryTick(loop), interval * (0.8 + Math.random() * 0.4));
-    loop.timer.unref?.();
-  }
-
-  /**
-   * The delay between two passes of the recovery loop: `recovery.workflowScanIntervalMs` when
-   * configured, otherwise its default, or a longer one on a store that reads every run of a
-   * workflow to list its active runs. `undefined` on a store without run ownership support,
-   * where a later pass would restart runs that are still running.
-   */
-  async #workflowScanInterval(): Promise<number | undefined> {
     const workflowsStore = await this.#storage?.getStore('workflows');
     const fenced = await Promise.resolve()
       .then(() => workflowsStore?.supportsRunFencing())
-      .catch(() => true);
-    if (!workflowsStore || !fenced) return undefined;
-    return this.#workflowScanIntervalSet ? this.#recoveryConfig.workflowScanIntervalMs! : DEFAULT_FULL_LISTING_SCAN_INTERVAL_MS;
+      .catch(() => undefined);
+    // Without run ownership support no lease tells an orphaned run from a running one, so the
+    // loop does nothing; the deployer's boot-time call still sweeps such a store once.
+    if (!workflowsStore || fenced === false) {
+      if (this.#workflowRecoveryLoop === loop) this.#workflowRecoveryLoop = undefined;
+      return;
+    }
+    // A probe that failed skips this pass only.
+    if (fenced) {
+      // Tracked so shutdown() waits for a pass that may still be queueing restarts. The pass
+      // does not wait for the restarts it queued.
+      await this.#trackDurableRecovery(
+        this.#joinWorkflowRecoveryPass('orphaned', running).then(
+          () => {},
+          error => this.#logger.error('Failed to check workflow runs for recovery', { error }),
+        ),
+      );
+    }
+    if (!running()) return;
+    const interval = this.#workflowScanIntervalSet
+      ? this.#recoveryConfig.workflowScanIntervalMs!
+      : DEFAULT_FULL_LISTING_SCAN_INTERVAL_MS;
+    loop.timer = setTimeout(
+      () => void this.#runWorkflowRecoveryTick(loop),
+      Math.min(interval * (0.8 + Math.random() * 0.4), MAX_TIMER_DELAY_MS),
+    );
+    loop.timer.unref?.();
   }
 
   /**

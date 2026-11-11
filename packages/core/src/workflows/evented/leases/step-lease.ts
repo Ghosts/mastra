@@ -10,6 +10,7 @@ import {
   WORKFLOW_RUN_LEASE_TTL_MS,
   renewWorkflowLease,
 } from '../../run-ownership';
+import { holdHandedOffStepLease } from './held-leases';
 import { processLiveness } from './liveness';
 import type { LivenessScope } from './liveness';
 
@@ -22,7 +23,8 @@ export interface StepLeaseHandoff {
 /** A step occurrence lease held by this worker, renewed until it is released or handed off. */
 export interface StepLease {
   /**
-   * Stops renewing and returns the claim to attach to the follow-up event.
+   * Returns the claim to attach to the follow-up event. From here the lease is
+   * renewed until the follow-up's delivery takes it over (or the hold limit).
    * The lease stays this worker's until {@link StepLease.confirmHandOff}, so a
    * follow-up that is never published is released like any other lease.
    */
@@ -226,10 +228,14 @@ async function holdStepLease({
 
   let handedOff = false;
   let released = false;
+  let endHandOffHold: (() => void) | undefined;
   return {
     handOff() {
-      // Renewal stops here, before the follow-up is published, so the receiver's claim can win.
+      // This renewal stops here, before the follow-up is published, so the receiver's claim can
+      // win. The hand-off hold renews it instead until the receiver takes it over: a retry's
+      // delivery can sit in the broker for longer than a lease TTL.
       stopRenewing();
+      endHandOffHold ??= holdHandedOffStepLease({ scope, store, fence, logger });
       return { key: fence.runId, generation: fence.generation };
     },
     confirmHandOff() {
@@ -244,6 +250,8 @@ async function holdStepLease({
         return;
       }
 
+      // The follow-up was never published, so nothing will take the held lease over.
+      endHandOffHold?.();
       released = true;
       try {
         await store.releaseRunOwnership(fence);

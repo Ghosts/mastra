@@ -6,10 +6,14 @@ import type { WorkflowsStorage } from '../../../storage/domains/workflows/base';
 import type { RunOwnershipRecord } from '../../../storage/run-fencing';
 import type { SerializedSingleStepEntry, WorkflowRunState } from '../../types';
 import { isQueuedForeachIteration } from '../workflow-event-processor/loop';
+import { forEachBounded } from './bounded';
 import { runLivenessKey, stepOccurrenceKey } from './keys';
 
 // Nested workflows nest a few levels at most; the bound only stops a corrupt snapshot from looping.
 export const MAX_NESTED_RUN_DEPTH = 16;
+
+// Reads one recovery check or restart check sends at once while it walks a run's nested runs.
+export const NESTED_RUN_READ_CONCURRENCY = 8;
 
 /**
  * The nested runs a running step result still drives: its own nested run, or
@@ -144,96 +148,118 @@ export function stoppedMidStep(
   });
 }
 
+/** A nested run a running step drives, as stored, with the nested runs it drives in turn. */
+export interface StoredNestedRun {
+  runId: string;
+  snapshot: WorkflowRunState;
+  /** When the nested run was last written, in milliseconds; `NaN` when unreadable. */
+  updatedAt: number;
+  nested: StoredNestedRun[];
+}
+
 /**
- * Whether a nested run one of the run's running steps drives, or a run nested
- * deeper, lost the worker running one of its steps (see {@link stoppedMidStep}).
- * A nested run a worker keeps live did not. Reads each nested run's stored
- * state and, in one batch per nested run, its liveness key and step leases.
+ * The nested runs the run's running steps drive, and the runs nested deeper,
+ * each read from storage once, a few at a time. Empty for a run that drives
+ * none, which costs no read.
  */
-export async function nestedRunStoppedMidStep({
+export async function loadNestedRuns({
   store,
   snapshot,
 }: {
   store: WorkflowsStorage;
   snapshot: WorkflowRunState;
-}): Promise<boolean> {
-  const visit = async (snapshot: WorkflowRunState, depth: number): Promise<boolean> => {
+}): Promise<StoredNestedRun[]> {
+  const visit = async (snapshot: WorkflowRunState, depth: number): Promise<StoredNestedRun[]> => {
     if (depth >= MAX_NESTED_RUN_DEPTH) {
-      return false;
+      return [];
     }
 
-    for (const [stepId, result] of stepResultsOf(snapshot.context)) {
-      for (const nestedRunId of runningNestedRunIds(result)) {
-        const nested = await store.loadWorkflowSnapshot({ workflowName: stepId, runId: nestedRunId });
-        if (!nested) {
-          continue;
-        }
-
-        const keys = runningStepOccurrenceKeys(nestedRunId, nested);
-        const leases = await store.getRunOwnerships({ runIds: [runLivenessKey(nestedRunId), ...keys] });
-        if (leases.get(runLivenessKey(nestedRunId))?.live) {
-          continue;
-        }
-
-        if (stoppedMidStep(nestedRunId, nested, leases) || (await visit(nested, depth + 1))) {
-          return true;
-        }
+    // Nested runs are stored under the id of the step that runs them.
+    const driven = stepResultsOf(snapshot.context).flatMap(([stepId, result]) =>
+      runningNestedRunIds(result).map(runId => ({ stepId, runId })),
+    );
+    const loaded: StoredNestedRun[] = [];
+    await forEachBounded(driven, NESTED_RUN_READ_CONCURRENCY, async ({ stepId, runId }) => {
+      const run = await store.getWorkflowRunById({ runId, workflowName: stepId });
+      if (!run) {
+        return;
       }
-    }
 
-    return false;
+      const nestedSnapshot: WorkflowRunState = typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot;
+      loaded.push({
+        runId,
+        snapshot: nestedSnapshot,
+        updatedAt: new Date(run.updatedAt).getTime(),
+        nested: await visit(nestedSnapshot, depth + 1),
+      });
+    });
+
+    return loaded;
   };
 
   return visit(snapshot, 0);
 }
 
+/** Every nested run of `nested`, the deeper ones included. */
+function allNestedRuns(nested: StoredNestedRun[]): StoredNestedRun[] {
+  return nested.flatMap(run => [run, ...allNestedRuns(run.nested)]);
+}
+
+/** The lease keys {@link nestedRunStoppedMidStep} reads: each nested run's liveness key and running step leases. */
+export function nestedRunLeaseKeys(nested: StoredNestedRun[]): string[] {
+  return allNestedRuns(nested).flatMap(run => [
+    runLivenessKey(run.runId),
+    ...runningStepOccurrenceKeys(run.runId, run.snapshot),
+  ]);
+}
+
 /**
- * Whether the run, or a nested run one of its running steps drives, is in a
- * `sleep` or `sleepUntil` step. A sleep holds no lease: the process that
- * started it wakes the run with a timer, so a sleeping run looks orphaned to
- * anything that only reads leases. A sleep's result stays `waiting` after the
- * run moves on, so only a sleep the run lists in `activeStepsPath` at a path
- * within its current `activePaths` counts. Nested runs are read from storage,
- * at most one level per running nested step.
+ * Whether one of the `nested` runs, or a run nested deeper, lost the worker
+ * running one of its steps (see {@link stoppedMidStep}). A nested run a worker
+ * keeps live did not, and neither did the runs it drives. `leases` holds the
+ * keys {@link nestedRunLeaseKeys} lists.
  */
-export async function isRunAsleep({
-  store,
-  snapshot,
-}: {
-  store: WorkflowsStorage;
-  snapshot: WorkflowRunState;
-}): Promise<boolean> {
-  const visit = async (snapshot: WorkflowRunState | null, depth: number): Promise<boolean> => {
-    if (!snapshot) {
-      return false;
-    }
+export function nestedRunStoppedMidStep(nested: StoredNestedRun[], leases: Map<string, RunOwnershipRecord>): boolean {
+  return nested.some(
+    run =>
+      !leases.get(runLivenessKey(run.runId))?.live &&
+      (stoppedMidStep(run.runId, run.snapshot, leases) || nestedRunStoppedMidStep(run.nested, leases)),
+  );
+}
 
-    const steps = stepResultsOf(snapshot.context);
-    const active = snapshot.activeStepsPath ?? {};
-    // A sleep id can linger in `activeStepsPath` after the run moved on; only a sleep on the
-    // run's current path counts.
-    const activePaths = snapshot.activePaths ?? [];
-    const current = (path: number[] | undefined) =>
-      Array.isArray(path) && activePaths.length > 0 && activePaths.every((index, i) => path[i] === index);
-    if (steps.some(([stepId, result]) => result?.status === 'waiting' && current(active[stepId]))) {
-      return true;
-    }
+/** Whether a worker keeps one of the `nested` runs, or a run nested deeper, live. */
+export function nestedRunLive(nested: StoredNestedRun[], leases: Map<string, RunOwnershipRecord>): boolean {
+  return allNestedRuns(nested).some(run => leases.get(runLivenessKey(run.runId))?.live);
+}
 
-    if (depth >= MAX_NESTED_RUN_DEPTH) {
-      return false;
-    }
+/** When the run or one of the `nested` runs it drives was last written, in milliseconds. */
+export function lastWriteOf(updatedAt: number, nested: StoredNestedRun[]): number {
+  // An unreadable nested `updatedAt` must not make the whole run look unwritten.
+  return Math.max(
+    updatedAt,
+    ...allNestedRuns(nested).map(run => (Number.isNaN(run.updatedAt) ? -Infinity : run.updatedAt)),
+  );
+}
 
-    // Nested runs are stored under the id of the step that runs them.
-    for (const [stepId, result] of steps) {
-      for (const nestedRunId of runningNestedRunIds(result)) {
-        if (await visit(await store.loadWorkflowSnapshot({ workflowName: stepId, runId: nestedRunId }), depth + 1)) {
-          return true;
-        }
-      }
-    }
+/**
+ * Whether the run, or one of the `nested` runs it drives, is in a `sleep` or
+ * `sleepUntil` step. A sleep holds no lease: the process that started it wakes
+ * the run with a timer, so a sleeping run looks orphaned to anything that only
+ * reads leases. A sleep's result stays `waiting` after the run moves on, so
+ * only a sleep the run lists in `activeStepsPath` at a path within its current
+ * `activePaths` counts.
+ */
+export function isRunAsleep(snapshot: WorkflowRunState, nested: StoredNestedRun[]): boolean {
+  const steps = stepResultsOf(snapshot.context);
+  const active = snapshot.activeStepsPath ?? {};
+  // A sleep id can linger in `activeStepsPath` after the run moved on; only a sleep on the
+  // run's current path counts.
+  const activePaths = snapshot.activePaths ?? [];
+  const current = (path: number[] | undefined) =>
+    Array.isArray(path) && activePaths.length > 0 && activePaths.every((index, i) => path[i] === index);
+  if (steps.some(([stepId, result]) => result?.status === 'waiting' && current(active[stepId]))) {
+    return true;
+  }
 
-    return false;
-  };
-
-  return visit(snapshot, 0);
+  return nested.some(run => isRunAsleep(run.snapshot, run.nested));
 }

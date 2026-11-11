@@ -58,12 +58,13 @@ function startReplica(
 async function persistActiveRun(
   storage: InMemoryStore,
   runId: string,
-  { status = 'running' }: { status?: WorkflowRunStatus } = {},
+  { updatedAt, status = 'running' }: { updatedAt?: Date; status?: WorkflowRunStatus } = {},
 ) {
   const store = (await storage.getStore('workflows'))!;
   await store.persistWorkflowSnapshot({
     workflowName: 'recovered-wf',
     runId,
+    updatedAt,
     snapshot: { ...createEmptyWorkflowSnapshot(runId), status, activePaths: [], context: { input: {} } as any },
   });
 }
@@ -88,9 +89,14 @@ async function statuses(storage: InMemoryStore) {
 }
 
 describe('boot-time workflow recovery sweep (#28712)', () => {
-  it.each(['default', 'evented'] as const)(
-    '%s: leaves runs other processes keep alive unloaded and recovers the orphaned one',
-    async engine => {
+  it.each([
+    ['default', 'all'],
+    ['evented', 'all'],
+    ['default', 'orphaned'],
+    ['evented', 'orphaned'],
+  ] as const)(
+    '%s, %s mode: leaves runs other processes keep alive unloaded and recovers the orphaned one',
+    async (engine, mode) => {
       const storage = new InMemoryStore();
       const store = (await storage.getStore('workflows'))!;
       const executions: string[] = [];
@@ -105,11 +111,11 @@ describe('boot-time workflow recovery sweep (#28712)', () => {
         await persistActiveRun(storage, runId);
         await store.claimRunOwnership({ runId: liveKeys[i]!, ownerId: 'other-process', leaseMs: 60_000 });
       }
-
-      await persistActiveRun(storage, 'orphaned');
+      // No process wrote the orphaned run for longer than the stall threshold.
+      await persistActiveRun(storage, 'orphaned', { updatedAt: new Date(Date.now() - 10 * 60_000) });
       const loads = await countLoads(storage);
 
-      await mastra.restartAllActiveWorkflowRuns({ mode: 'all' });
+      await mastra.restartAllActiveWorkflowRuns({ mode });
 
       await vi.waitFor(() => expect(executions).toEqual(['orphaned']));
       expect(loads.get('orphaned')).toBeGreaterThan(0);

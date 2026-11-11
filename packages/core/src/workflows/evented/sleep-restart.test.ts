@@ -1,11 +1,36 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { EventEmitterPubSub } from '../../events/event-emitter';
+import { PubSub } from '../../events/pubsub';
+import type { EventCallback, SubscribeOptions } from '../../events/types';
 import { Mastra } from '../../mastra';
 import { MockStore } from '../../storage/mock';
 import { runLivenessKey } from './leases';
 import { abandonLease } from './test-utils/abandon-lease';
 import { createStep, createWorkflow } from '.';
+
+/**
+ * Delivers through an in-process emitter, but doesn't count as one: recovery treats it like a
+ * broker whose messages outlive the process that published them.
+ */
+class BrokerLikePubSub extends PubSub {
+  readonly #inner = new EventEmitterPubSub();
+  publish(...args: Parameters<PubSub['publish']>) {
+    return this.#inner.publish(...args);
+  }
+  subscribe(topic: string, cb: EventCallback, options?: SubscribeOptions) {
+    return this.#inner.subscribe(topic, cb, options);
+  }
+  unsubscribe(topic: string, cb: EventCallback) {
+    return this.#inner.unsubscribe(topic, cb);
+  }
+  flush() {
+    return this.#inner.flush();
+  }
+  override get supportedModes() {
+    return this.#inner.supportedModes;
+  }
+}
 
 function createSleepingWorkflow({
   id,
@@ -78,7 +103,10 @@ async function startSleepingRun({
 }
 
 describe('evented workflow durable sleep recovery', () => {
-  it('replays a sleeping path after restart without rerunning completed work', async () => {
+  it.each([
+    ['an in-process pubsub', () => new EventEmitterPubSub()],
+    ['a pubsub shared across processes', () => new BrokerLikePubSub()],
+  ] as const)('replays a sleeping path after restart without rerunning completed work, with %s', async (_, pubsub) => {
     const storage = new MockStore();
     const beforeSleep = vi.fn(async () => ({ value: 'persist me' }));
     const afterSleep = vi.fn(async ({ inputData }: { inputData: { value: string } }) => inputData);
@@ -92,11 +120,12 @@ describe('evented workflow durable sleep recovery', () => {
     const replacementRuntime = new Mastra({
       logger: false,
       storage,
-      pubsub: new EventEmitterPubSub(),
+      pubsub: pubsub(),
       workflows: { [workflow.id]: workflow },
     });
+    // Boots like a server: the boot pass restarts a sleeping run whose process stopped.
     await replacementRuntime.startWorkers();
-    await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'all' });
+    await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
 
     // The sweep returns once the restart is handed to the workers; the replayed sleep still runs out.
     await vi.waitFor(
@@ -134,7 +163,7 @@ describe('evented workflow durable sleep recovery', () => {
       workflows: { [workflow.id]: workflow },
     });
     await replacementRuntime.startWorkers();
-    await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'all' });
+    await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
 
     await vi.waitFor(
       async () => {
@@ -172,7 +201,7 @@ describe('evented workflow durable sleep recovery', () => {
       workflows: { [workflow.id]: workflow },
     });
     await replacementRuntime.startWorkers();
-    await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'all' });
+    await replacementRuntime.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
 
     expect(createRun).not.toHaveBeenCalled();
     const snapshot = await workflowsStore?.loadWorkflowSnapshot({

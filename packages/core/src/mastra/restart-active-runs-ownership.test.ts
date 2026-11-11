@@ -241,6 +241,57 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
     expect(executions).toEqual(['A:approve:suspended', 'A:approve:resumed', 'A:after']);
   }, 15_000);
 
+  it('does not restart a queued run that its owner took up again while it waited for a recovery slot', async () => {
+    const storage = new InMemoryStore();
+    const executions: string[] = [];
+    const first = Promise.withResolvers<void>();
+    const finishFirst = Promise.withResolvers<void>();
+    const replica = buildReplica(
+      storage,
+      async runId => {
+        executions.push(runId);
+        first.resolve();
+        await finishFirst.promise;
+      },
+      { workflowConcurrency: 1 },
+    );
+    replicas.push(replica);
+    // Two runs whose process stopped long ago.
+    const runs = [
+      await persistOrphanedRun(storage, replica, -2 * WORKFLOW_RUN_LEASE_TTL_MS),
+      await persistOrphanedRun(storage, replica, -2 * WORKFLOW_RUN_LEASE_TTL_MS),
+    ];
+
+    const pass = replica.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
+    await first.promise;
+    const restarted = runs.find(orphaned => orphaned.run.runId === executions[0])!;
+    const waiting = runs.find(orphaned => orphaned !== restarted)!;
+    // While the first restart holds the only slot, the second run's owner resumes it: it writes
+    // the run and takes and releases its lease, as a resume does before the engine claims it.
+    const { workflowsStore } = waiting;
+    const { record } = await workflowsStore.claimRunOwnership({
+      runId: waiting.run.runId,
+      ownerId: 'resuming-process',
+      leaseMs: WORKFLOW_RUN_LEASE_TTL_MS,
+      force: true,
+    });
+    await workflowsStore.releaseRunOwnership({
+      runId: waiting.run.runId,
+      generation: record!.generation,
+      ownerId: 'resuming-process',
+    });
+    await workflowsStore.updateWorkflowState({
+      workflowName: waiting.workflow.id,
+      runId: waiting.run.runId,
+      opts: { status: 'running' },
+    });
+
+    finishFirst.resolve();
+    await pass;
+    expect(executions).toEqual([restarted.run.runId]);
+    expect(await waiting.status()).toBe('running');
+  }, 15_000);
+
   it('keeps recovering after a tick of the recovery loop fails to read storage', async () => {
     const storage = new InMemoryStore();
     const executions: string[] = [];
@@ -302,24 +353,36 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
     expect(listings.mock.calls.length).toBe(listedBeforeShutdown);
   }, 15_000);
 
-  it("runs no recovery loop with recovery.workflows 'off'", async () => {
-    const runOn = async (recovery: MastraRecoveryConfig) => {
-      const storage = new InMemoryStore();
-      const replica = buildReplica(storage, async () => {}, recovery);
-      replicas.push(replica);
-      const orphaned = await persistOrphanedRun(storage, replica, 300);
-      const listings = vi.spyOn(orphaned.workflowsStore, 'listWorkflowRuns');
-      await replica.startWorkers();
-      return { ...orphaned, listings };
-    };
-    const auto = await runOn(scanning);
-    const off = await runOn({ ...scanning, workflows: 'off' });
+  it.each([
+    ["recovery.workflows 'off'", { ...scanning, workflows: 'off' } as MastraRecoveryConfig, false],
+    ['a store without run ownership support', scanning, true],
+  ] as const)(
+    'runs no recovery loop with %s',
+    async (_, recovery, unfenced) => {
+      const runOn = async (recovery: MastraRecoveryConfig, unfenced: boolean) => {
+        const storage = new InMemoryStore();
+        const replica = buildReplica(storage, async () => {}, recovery);
+        replicas.push(replica);
+        const orphaned = await persistOrphanedRun(storage, replica, 300);
+        if (unfenced) vi.spyOn(orphaned.workflowsStore, 'supportsRunFencing').mockReturnValue(false);
+        const listings = vi.spyOn(orphaned.workflowsStore, 'listWorkflowRuns');
+        await replica.startWorkers();
+        return { ...orphaned, replica, listings };
+      };
+      const auto = await runOn(scanning, false);
+      const off = await runOn(recovery, unfenced);
 
-    // By the time the loop of the other instance recovered its run on a later tick, this one listed nothing.
-    await expect.poll(auto.status, { timeout: 5_000 }).toBe('success');
-    expect(off.listings).not.toHaveBeenCalled();
-    expect(await off.status()).toBe('running');
-  }, 15_000);
+      // By the time the loop of the other instance recovered its run on a later tick, this one listed nothing.
+      await expect.poll(auto.status, { timeout: 5_000 }).toBe('success');
+      expect(off.listings).not.toHaveBeenCalled();
+      expect(await off.status()).toBe('running');
+      if (!unfenced) return;
+      // The server's boot-time call still sweeps a store without run ownership support once.
+      await off.replica.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
+      await expect.poll(off.status, { timeout: 5_000 }).toBe('success');
+    },
+    15_000,
+  );
 
   it('does not keep the process alive while the recovery loop waits for its next tick', async () => {
     const replica = buildReplica(new InMemoryStore(), async () => {}, { workflowScanIntervalMs: 60_000 });
@@ -328,7 +391,7 @@ describe('boot-time workflow recovery and run ownership (#25579)', () => {
 
     await replica.startWorkers();
     // Joins the loop's first pass, after which the loop schedules its next tick.
-    await replica.restartAllActiveWorkflowRuns();
+    await replica.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
     await new Promise(resolve => setImmediate(resolve));
 
     // The next tick, 60s give or take a fifth.

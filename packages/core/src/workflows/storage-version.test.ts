@@ -8,6 +8,7 @@ import { createWorkflow } from './create';
 import { DefaultExecutionEngine } from './default';
 import { createWorkflow as createEventedWorkflow } from './evented';
 import { withoutNestedRunStartState } from './nested-state';
+import { WORKFLOW_RUN_LEASE_TTL_MS } from './run-ownership';
 import { createStep } from './workflow';
 import type { AnyWorkflow } from './workflow';
 
@@ -1490,8 +1491,9 @@ function innerCheckpoints(sends: ReturnType<typeof recordStateSends>) {
 /** A dead process stops renewing its run ownership leases; let them lapse so another process can restart its runs. */
 async function expireRunLeases(storage: InstanceType<typeof MockStore>) {
   const store = storage.stores.workflows!;
+  // Longer ago than the grace recovery gives a lapsed lease.
   for (const runId of [...(store as any).db.runOwners.keys()]) {
-    await store.claimRunOwnership({ runId, ownerId: 'lapsed', leaseMs: -1, force: true });
+    await store.claimRunOwnership({ runId, ownerId: 'lapsed', leaseMs: -2 * WORKFLOW_RUN_LEASE_TTL_MS, force: true });
   }
 }
 
@@ -1779,7 +1781,9 @@ describe('storage v2 nested runs', () => {
       await vi.waitFor(() => expect(died).toBe(true));
       await expireRunLeases(storage);
 
-      await new Mastra({ logger: false, storage, workflows: build() }).restartAllActiveWorkflowRuns({ mode: 'all' });
+      await new Mastra({ logger: false, storage, workflows: build() }).restartAllActiveWorkflowRuns({
+        mode: 'orphaned',
+      });
 
       expect(innerBRuns).toBe(1);
       const state = { items: [PAD, 'before:0', 'inner-a:1', 'inner-b:2'] };

@@ -232,42 +232,54 @@ describe('Mastra.restartAllActiveWorkflowRuns', () => {
     expect(live.restart).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps restarting other runs when one run has an unparseable snapshot', async () => {
-    const corruptWorkflow = createWorkflow({
-      id: 'corrupt-wf',
-      inputSchema: z.object({}),
-      outputSchema: z.object({}),
-    }).commit();
-    const liveWorkflow = createWorkflow({
-      id: 'live-wf',
-      inputSchema: z.object({}),
-      outputSchema: z.object({}),
-    }).commit();
-    const storage = new MockStore();
-    const mastra = new Mastra({
-      logger: false,
-      storage,
-      workflows: { corruptWorkflow, liveWorkflow },
-    });
-    const corrupt = await stubActiveRun(storage, corruptWorkflow, 'corrupt-run');
-    const live = await stubActiveRun(storage, liveWorkflow, 'live-run');
-    // Stores hand back a snapshot they fail to parse as the raw string, e.g. a truncated row.
-    const workflows = (await storage.getStore('workflows'))!;
-    const listWorkflowRuns = workflows.listWorkflowRuns.bind(workflows);
-    vi.spyOn(workflows, 'listWorkflowRuns').mockImplementation(async args => {
-      const listed = await listWorkflowRuns(args);
-      return {
-        ...listed,
-        runs: listed.runs.map(run =>
-          run.runId === 'corrupt-run' ? { ...run, snapshot: '{"status":"running","value"' } : run,
-        ),
-      };
-    });
+  // An `orphaned` pass cannot judge an unparseable run, so it restarts it unless a process keeps
+  // it live, rather than skip it on every pass; it leaves the parseable run nobody left alone.
+  it.each([
+    ['all', ['live', 'corrupt']],
+    ['orphaned', ['corrupt']],
+  ] as const)(
+    '%s mode: keeps restarting other runs when one run has an unparseable snapshot',
+    async (mode, restarted) => {
+      const corruptWorkflow = createWorkflow({
+        id: 'corrupt-wf',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      }).commit();
+      const liveWorkflow = createWorkflow({
+        id: 'live-wf',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      }).commit();
+      const storage = new MockStore();
+      const mastra = new Mastra({
+        logger: false,
+        storage,
+        workflows: { corruptWorkflow, liveWorkflow },
+      });
+      const corrupt = await stubActiveRun(storage, corruptWorkflow, 'corrupt-run');
+      const live = await stubActiveRun(storage, liveWorkflow, 'live-run');
+      // Stores hand back a snapshot they fail to parse as the raw string, e.g. a truncated row.
+      const workflows = (await storage.getStore('workflows'))!;
+      const listWorkflowRuns = workflows.listWorkflowRuns.bind(workflows);
+      const corruptSnapshot = '{"status":"running","value"';
+      vi.spyOn(workflows, 'listWorkflowRuns').mockImplementation(async args => {
+        const listed = await listWorkflowRuns(args);
+        return {
+          ...listed,
+          runs: listed.runs.map(run => (run.runId === 'corrupt-run' ? { ...run, snapshot: corruptSnapshot } : run)),
+        };
+      });
+      const getWorkflowRunById = workflows.getWorkflowRunById.bind(workflows);
+      vi.spyOn(workflows, 'getWorkflowRunById').mockImplementation(async args => {
+        const run = await getWorkflowRunById(args);
+        return run && args.runId === 'corrupt-run' ? { ...run, snapshot: corruptSnapshot } : run;
+      });
 
-    await expect(mastra.restartAllActiveWorkflowRuns({ mode: 'all' })).resolves.toBeUndefined();
-    expect(live.restart).toHaveBeenCalledTimes(1);
-    expect(corrupt.restart).toHaveBeenCalledTimes(1);
-  });
+      await expect(mastra.restartAllActiveWorkflowRuns({ mode })).resolves.toBeUndefined();
+      expect(live.restart).toHaveBeenCalledTimes((restarted as readonly string[]).includes('live') ? 1 : 0);
+      expect(corrupt.restart).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it('resolves recovery defaults', () => {
     expect(new Mastra({ logger: false }).recoveryConfig).toEqual({

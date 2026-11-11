@@ -13,10 +13,7 @@ import { forEachBounded } from './bounded';
 import { holdRestartLease } from './held-leases';
 import { restartLeaseKey, runLivenessKey } from './keys';
 import type { LivenessScope } from './liveness';
-import { MAX_NESTED_RUN_DEPTH, runningNestedRunIds } from './recovery-state';
-
-// Reads one restart check sends at once while it walks a run's nested runs.
-const NESTED_RUN_READ_CONCURRENCY = 8;
+import { MAX_NESTED_RUN_DEPTH, NESTED_RUN_READ_CONCURRENCY, runningNestedRunIds } from './recovery-state';
 
 /**
  * The liveness lease of the run, or of a nested run one of its running steps

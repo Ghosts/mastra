@@ -135,21 +135,18 @@ describe('evented recovery loop (#28712)', () => {
   }, 20_000);
 
   /**
-   * A broker that delivers the first `workflows` event `pick` matches `ms` late, the way a busy
-   * one does. The publisher goes on meanwhile.
+   * A broker that delivers every `workflows` event `pick` matches `ms` late, the way a busy one
+   * does. The publisher goes on meanwhile.
    */
-  const delayFirst = (pick: (event: Event) => boolean, ms: number): PubSub => {
-    const inner = new EventEmitterPubSub();
-    let delayed = false;
-    return new Proxy(inner, {
+  const delayDeliveries = (pick: (event: Event) => boolean, ms: number): PubSub =>
+    new Proxy(new EventEmitterPubSub(), {
       get(target, prop) {
         if (prop === 'subscribe') {
           return (topic: string, cb: (event: Event, ...rest: any[]) => unknown, ...options: any[]) =>
             target.subscribe(
               topic,
               async (event: Event, ...rest: any[]) => {
-                if (topic === 'workflows' && !delayed && pick(event)) {
-                  delayed = true;
+                if (topic === 'workflows' && pick(event)) {
                   await sleep(ms);
                 }
 
@@ -163,7 +160,20 @@ describe('evented recovery loop (#28712)', () => {
         return typeof value === 'function' ? value.bind(target) : value;
       },
     });
+
+  /** Like {@link delayDeliveries}, for the first matching event only. */
+  const delayFirst = (pick: (event: Event) => boolean, ms: number): PubSub => {
+    let delayed = false;
+    return delayDeliveries(event => {
+      if (delayed || !pick(event)) {
+        return false;
+      }
+
+      delayed = true;
+      return true;
+    }, ms);
   };
+  const carriesHandoff = (event: Event) => !!(event.data as { stepLeaseHandoff?: unknown })?.stepLeaseHandoff;
   // Long enough for the run's liveness to lapse, far below the stall threshold.
   const backlog = WORKFLOW_RUN_LEASE_TTL_MS * 4;
 
@@ -218,7 +228,167 @@ describe('evented recovery loop (#28712)', () => {
       input: [{ n: 1 }, { n: 2 }, { n: 3 }] as unknown,
       labels: ['item:1', 'item:2', 'item:3'],
     },
+    "a failed step's retry event": {
+      pick: (event: Event) => event.type === 'workflow.step.run' && carriesHandoff(event),
+      build: (report: Report) => {
+        let attempts = 0;
+        return {
+          workflow: createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num, retryConfig: { attempts: 1 } })
+            .then(
+              createStep({
+                id: 'flaky',
+                inputSchema: Num,
+                outputSchema: Num,
+                execute: async ({ inputData }) => {
+                  attempts++;
+                  await report(`flaky:${attempts}`);
+                  if (attempts === 1) {
+                    throw new Error('transient');
+                  }
+
+                  return inputData;
+                },
+              }),
+            )
+            .then(work('after', report))
+            .commit(),
+          nested: {},
+        };
+      },
+      input: { n: 1 } as unknown,
+      labels: ['flaky:1', 'flaky:2', 'after'],
+    },
   };
+
+  it('fails a run whose step keeps failing once its retries run out, while the broker holds each retry back', async () => {
+    const storage = new InMemoryStore();
+    let attempts = 0;
+    const workflow = createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num, retryConfig: { attempts: 2 } })
+      .then(
+        createStep({
+          id: 'broken',
+          inputSchema: Num,
+          outputSchema: Num,
+          execute: async () => {
+            attempts++;
+            throw new Error('always fails');
+          },
+        }),
+      )
+      .commit();
+    // Every retry event reaches its worker two lease TTLs late.
+    const a = await startReplica(storage, workflow as unknown as Built, {
+      pubsub: delayDeliveries(carriesHandoff, WORKFLOW_RUN_LEASE_TTL_MS * 2),
+      recovery: scanning,
+    });
+    const run = await a.workflow.createRun();
+    const restarts = await recordRestarts(storage, run.runId);
+
+    expect((await run.start({ inputData: { n: 1 } })).status).toBe('failed');
+    expect(attempts).toBe(3);
+    expect(restarts).toEqual([]);
+  }, 20_000);
+
+  it('restarts at boot a run whose next step event died with an in-process pubsub', async () => {
+    const storage = new InMemoryStore();
+    const tracked = track({ blocks: [] });
+    const lost = Promise.withResolvers<void>();
+    // A's process stops right after the first step: the event of the second dies with it.
+    const pubsub = interceptWorkflowEvents(new EventEmitterPubSub(), event =>
+      isStepRunAt(event, [1]) && !(event.data as { restart?: unknown }).restart
+        ? { divert: () => lost.resolve() }
+        : undefined,
+    );
+    const build = (report: Report) =>
+      createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num })
+        .then(work('first', report))
+        .then(work('second', report))
+        .commit() as unknown as Built;
+    const a = await startReplica(storage, build(tracked.reporter('A')), { pubsub });
+    const run = await a.workflow.createRun();
+    void run.start({ inputData: { n: 1 } });
+    await lost.promise;
+    await crash(a, storage, [runLivenessKey(run.runId)]);
+
+    // B boots with the default stall threshold: its first pass restarts the run at once.
+    await startReplica(storage, build(tracked.reporter('B')), { recovery: scanning });
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 5_000 });
+    expect(tracked.executions).toEqual(['A:first', 'B:second']);
+  }, 20_000);
+
+  it("leaves a run alone while the nested run doing its work wrote recently, though the run's own row is old", async () => {
+    const storage = new InMemoryStore();
+    const stallMs = 1_000;
+    const executions: string[] = [];
+    const child = createWorkflow({ id: 'child', inputSchema: Num, outputSchema: Num })
+      .then(
+        createStep({
+          id: 'c1',
+          inputSchema: Num,
+          outputSchema: Num,
+          execute: async ({ inputData }) => {
+            executions.push('c1');
+            // Longer than the stall threshold; the parent's row isn't written meanwhile.
+            await sleep(stallMs * 1.2);
+            return inputData;
+          },
+        }),
+      )
+      .then(work('c2', async label => void executions.push(label)))
+      .commit();
+    const workflow = createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: z.any() }).then(child).commit();
+    // The child's second step event arrives late enough for the child's liveness to lapse.
+    const a = await startReplica(storage, workflow as unknown as Built, {
+      pubsub: delayFirst(
+        event => isStepRunAt(event, [1]) && (event.data as { workflowId?: string }).workflowId === 'child',
+        WORKFLOW_RUN_LEASE_TTL_MS * 1.5,
+      ),
+      nested: { child } as unknown as Record<string, Built>,
+      recovery: { ...scanning, workflowStallThresholdMs: stallMs },
+    });
+    const run = await a.workflow.createRun();
+    const restarts = await recordRestarts(storage, run.runId);
+
+    expect((await run.start({ inputData: { n: 1 } })).status).toBe('success');
+    expect(restarts).toEqual([]);
+    expect(executions).toEqual(['c1', 'c2']);
+  }, 20_000);
+
+  it("continues a failing step's attempt count when its worker crashed during a retry", async () => {
+    const storage = new InMemoryStore();
+    const executions: string[] = [];
+    const retrying = Promise.withResolvers<void>();
+    const build = (replica: string) =>
+      createWorkflow({ id: 'leased', inputSchema: Num, outputSchema: Num, retryConfig: { attempts: 2 } })
+        .then(
+          createStep({
+            id: 'broken',
+            inputSchema: Num,
+            outputSchema: Num,
+            execute: async ({ retryCount }) => {
+              executions.push(`${replica}:${retryCount}`);
+              // A crashes during its first retry.
+              if (replica === 'A' && retryCount === 1) {
+                retrying.resolve();
+                await new Promise<never>(() => {});
+              }
+
+              throw new Error('always fails');
+            },
+          }),
+        )
+        .commit() as unknown as Built;
+    const a = await startReplica(storage, build('A'));
+    await startReplica(storage, build('B'), { recovery: scanning });
+    const run = await a.workflow.createRun();
+    void run.start({ inputData: { n: 1 } });
+    await retrying.promise;
+    await crash(a, storage, [stepOccurrenceKey(run.runId, [0]), runLivenessKey(run.runId)]);
+
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('failed'), { timeout: 10_000 });
+    // B runs the interrupted retry again and the one retry left, not every attempt anew.
+    expect(executions).toEqual(['A:0', 'A:1', 'B:1', 'B:2']);
+  }, 20_000);
 
   it.each(Object.keys(delayedEvents) as (keyof typeof delayedEvents)[])(
     'runs each step once when the broker holds %s back for longer than the lease TTL',
@@ -312,6 +482,10 @@ describe('evented recovery loop (#28712)', () => {
     const restarts = await recordRestarts(storage, left.runId);
     expect((await (await workflow.createRun({ runId: restarted.runId })).restart()).status).toBe('success');
 
+    // A loop started with those workers would have ticked several times within this window.
+    const listings = vi.spyOn((await storage.getStore('workflows'))!, 'listWorkflowRuns');
+    await sleep(scanning.workflowScanIntervalMs * 3);
+    expect(listings).not.toHaveBeenCalled();
     expect(tracked.executions).toEqual(['A:a', 'A:a', 'B:a']);
     expect(restarts).toEqual([]);
     expect(await runStatus(storage, left.runId)).toBe('running');
