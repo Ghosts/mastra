@@ -10,16 +10,16 @@ import { forEachBounded } from './bounded';
 import { runLivenessKey, stepOccurrenceKey } from './keys';
 
 // Nested workflows nest a few levels at most; the bound only stops a corrupt snapshot from looping.
-export const MAX_NESTED_RUN_DEPTH = 16;
+const MAX_NESTED_RUN_DEPTH = 16;
 
 // Reads one recovery check or restart check sends at once while it walks a run's nested runs.
-export const NESTED_RUN_READ_CONCURRENCY = 8;
+const NESTED_RUN_READ_CONCURRENCY = 8;
 
 /**
  * The nested runs a running step result still drives: its own nested run, or
  * the nested runs of the foreach items that have not finished.
  */
-export function runningNestedRunIds(
+function runningNestedRunIds(
   result: { status?: unknown; metadata?: unknown; output?: unknown } | undefined,
 ): string[] {
   if (result?.status !== 'running') {
@@ -201,7 +201,7 @@ export async function loadNestedRuns({
 }
 
 /** Every nested run of `nested`, the deeper ones included. */
-function allNestedRuns(nested: StoredNestedRun[]): StoredNestedRun[] {
+export function allNestedRuns(nested: StoredNestedRun[]): StoredNestedRun[] {
   return nested.flatMap(run => [run, ...allNestedRuns(run.nested)]);
 }
 

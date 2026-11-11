@@ -9,11 +9,10 @@ import type { RunOwnershipRecord } from '../../../storage/run-fencing';
 import { WORKFLOW_RUN_LEASE_TTL_MS } from '../../run-ownership';
 import type { WorkflowRunOwnership } from '../../run-ownership';
 import type { WorkflowRunState } from '../../types';
-import { forEachBounded } from './bounded';
 import { holdRestartLease } from './held-leases';
 import { restartLeaseKey, runLivenessKey } from './keys';
 import type { LivenessScope } from './liveness';
-import { MAX_NESTED_RUN_DEPTH, NESTED_RUN_READ_CONCURRENCY, runningNestedRunIds } from './recovery-state';
+import { allNestedRuns, loadNestedRuns } from './recovery-state';
 
 /**
  * The liveness lease of the run, or of a nested run one of its running steps
@@ -24,32 +23,20 @@ import { MAX_NESTED_RUN_DEPTH, NESTED_RUN_READ_CONCURRENCY, runningNestedRunIds 
 async function findLiveRun(
   store: WorkflowsStorage,
   runId: string,
-  context: WorkflowRunState['context'] | undefined,
+  snapshot: WorkflowRunState,
 ): Promise<RunOwnershipRecord | null> {
-  let earliest: RunOwnershipRecord | null = null;
+  const nested = await loadNestedRuns({ store, snapshot });
+  const keys = [runId, ...allNestedRuns(nested).map(run => run.runId)].map(runLivenessKey);
+  const leases = await store.getRunOwnerships({ runIds: keys });
 
-  const visit = async (runId: string, context: WorkflowRunState['context'] | undefined, depth: number) => {
-    // The earliest expiry is reported, so a refused restart is retried as soon as any key could lapse.
-    const record = await store.getRunOwnership({ runId: runLivenessKey(runId) });
-    if (record?.live && (!earliest || record.leaseExpiresAt! < earliest.leaseExpiresAt!)) {
+  // The earliest expiry is reported, so a refused restart is retried as soon as any key could lapse.
+  let earliest: RunOwnershipRecord | null = null;
+  for (const record of leases.values()) {
+    if (record.live && (!earliest || record.leaseExpiresAt! < earliest.leaseExpiresAt!)) {
       earliest = record;
     }
+  }
 
-    if (depth >= MAX_NESTED_RUN_DEPTH) {
-      return;
-    }
-
-    const nested = Object.entries(context ?? {}).flatMap(([stepId, result]) =>
-      runningNestedRunIds(result).map(nestedRunId => ({ stepId, nestedRunId })),
-    );
-    // Nested runs are stored under the id of the step that runs them.
-    await forEachBounded(nested, NESTED_RUN_READ_CONCURRENCY, async ({ stepId, nestedRunId }) => {
-      const snapshot = await store.loadWorkflowSnapshot({ workflowName: stepId, runId: nestedRunId });
-      await visit(nestedRunId, snapshot?.context, depth + 1);
-    });
-  };
-
-  await visit(runId, context, 0);
   return earliest;
 }
 
@@ -82,7 +69,7 @@ export async function claimEventedRestart({
     return unfenced;
   }
 
-  const live = await findLiveRun(store, runId, snapshot.context);
+  const live = await findLiveRun(store, runId, snapshot);
   if (live) {
     return { owner: live };
   }
