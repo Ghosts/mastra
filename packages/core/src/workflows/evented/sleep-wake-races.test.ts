@@ -474,9 +474,7 @@ describe('waking an evented sleep once (#30012)', () => {
     restarted.resolve();
 
     // With recovery off, only the interrupted wake running again wakes the sleep.
-    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), {
-      timeout: WORKFLOW_RUN_LEASE_TTL_MS / 2,
-    });
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 5_000 });
     expect(seen.executions).toEqual(['A:before', 'A:after']);
   }, 20_000);
 
@@ -536,11 +534,9 @@ describe('waking an evented sleep once (#30012)', () => {
     await sleep(100);
     await a.mastra.startWorkers();
 
-    // With recovery off, only the interrupted wake running again wakes the sleep, and the renewal
-    // must not have kept its lease from it.
-    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), {
-      timeout: WORKFLOW_RUN_LEASE_TTL_MS / 2,
-    });
+    // With recovery off, only the interrupted wake running again wakes the sleep. Had the renewal
+    // kept its lease from it, the wake would drop the sleep for good.
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 5_000 });
     expect(seen.executions).toEqual(['A:before', 'A:after']);
   }, 20_000);
 
@@ -613,11 +609,10 @@ describe('waking an evented sleep once (#30012)', () => {
     expect(seen.continuations).toEqual([]);
     expect(await storedSleeps(storage, run.runId)).toEqual(['waiting']);
 
-    // With recovery off, only the workers starting again wake it, well within a lease TTL.
+    // With recovery off, only the workers starting again wake it. A wake that found its own lease
+    // still held would drop the sleep for good, so the run would never finish.
     await a.mastra.startWorkers();
-    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), {
-      timeout: WORKFLOW_RUN_LEASE_TTL_MS / 2,
-    });
+    await vi.waitFor(async () => expect(await runStatus(storage, run.runId)).toBe('success'), { timeout: 5_000 });
     expect(seen.executions).toEqual(['A:before', 'A:after']);
   }, 20_000);
 
