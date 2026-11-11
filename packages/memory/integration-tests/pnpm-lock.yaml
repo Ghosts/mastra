@@ -45,7 +45,7 @@ overrides:
   nanoid@<5.1.16: 5.1.16
   source-map-js@>=1.0.0 <1.2.2: 1.2.2
   '@ai-sdk/provider-utils@>=4.0.0 <4.0.56': 4.0.56
-  '@ai-sdk/provider-utils@>=5.0.0 <5.0.52': 5.0.52
+  '@ai-sdk/provider-utils@>=5.0.0 <5.0.52': 5.0.76
 
 importers:
 
@@ -1615,6 +1615,7 @@ packages:
 
   tldts-core@7.4.20:
     resolution: {integrity: sha512-C630TWXZCZmLq0F2bW4QqwnaaxCQ/svpAqvJwnC4JvgEM5ohhBnGsEzTLSOXcN+xjz+kEaHS5uoWIw2klnqd0A==}
+    deprecated: Partial release, see https://github.com/remusao/tldts/issues/2735. Use >=7.4.22.
 
   tldts@7.4.19:
     resolution: {integrity: sha512-48dH6aSpQnpbzDUc4vIQZ1VjB8tkK+e8c1yx05/SZK+rkssgjEOlxDd/yU8/a4vGYQ9vRgJr9dwMq9TJ0b3X2Q==}
