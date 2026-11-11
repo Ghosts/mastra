@@ -2,4 +2,4 @@
 '@mastra/deployer': patch
 ---
 
-The `/__restart-active-workflow-runs` boot handler now calls `restartAllActiveWorkflowRuns({ mode: 'orphaned' })`. It joins the recovery loop that `startWorkers()` starts, and leaves alone the runs another instance still drives or that may only be waiting for their next step.
+After a reload, `mastra dev` restarts workflow runs with the recovery loop's rules: the `/__restart-active-workflow-runs` boot handler now calls `restartAllActiveWorkflowRuns({ mode: 'orphaned' })`. With the default in-process pubsub, the previous process marks its evented runs as no longer driven as it shuts down, so a run it left between steps is restarted at once. A step it left running is restarted once that step's lease lapses.

@@ -12,7 +12,7 @@ The loop checks storage every `recovery.workflowScanIntervalMs` (30 seconds by d
 - a default-engine run one lease TTL after its lease expired
 - a run that no instance keeps alive and that wasn't written for `recovery.workflowStallThresholdMs` (5 minutes by default), such as an evented run whose next step message was lost
 
-The first pass of an instance also restarts sleeping evented runs whose process stopped, as the boot-time restart did before. With the default in-process pubsub it also restarts evented runs waiting for their next step message, since those messages died with their process. Later passes leave sleeping runs alone. After an outage of every instance, an evented run waiting for its next step message on a broker that keeps messages is restarted only once `recovery.workflowStallThresholdMs` passed, not at boot. The loop restarts each run once even when several instances find it at the same time, and stops on `stopWorkers()` and `shutdown()`.
+The first pass of an instance also restarts sleeping evented runs whose process stopped, as the boot-time restart did before. With the default in-process pubsub it also restarts evented runs waiting for their next step message, since those messages died with their process. An instance on that pubsub marks its evented runs as no longer driven when `shutdown()` runs, so the next pass of any instance restarts them at once, even within one lease TTL of the shutdown. Later passes leave sleeping runs alone. After an outage of every instance, an evented run waiting for its next step message on a broker that keeps messages is restarted only once `recovery.workflowStallThresholdMs` passed, not at boot. The loop restarts each run once even when several instances find it at the same time, and stops on `stopWorkers()` and `shutdown()`.
 
 ```ts
 export const mastra = new Mastra({
@@ -29,6 +29,6 @@ export const mastra = new Mastra({
 await mastra.restartAllActiveWorkflowRuns({ mode: 'orphaned' });
 ```
 
-A failing evented step whose retry waits in the broker no longer looks like a crashed step, and a restart of a step that crashed during a retry continues from that retry instead of starting its attempts over.
+A restart of an evented step that crashed during a retry continues the attempt count instead of starting its attempts over.
 
 The in-memory store now moves a run's `updatedAt` on every write to the run, as the database stores do. The recovery loop reads it to find stalled runs.
