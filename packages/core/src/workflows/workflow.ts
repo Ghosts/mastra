@@ -5425,6 +5425,13 @@ export class Run<
     return this.#claimOwnership(false);
   }
 
+  /**
+   * Runs right before a `resume()` or `timeTravel()` caller flips the stored run to `running`,
+   * so an engine whose runs are recovered by liveness rather than by a run lease can mark the
+   * run live first. A failed claim leaves that mark to lapse on its own.
+   */
+  protected async beforeRunClaim(): Promise<void> {}
+
   async #executeOwned<T>(execute: () => Promise<T>): Promise<T> {
     const ownership = await this.#claimOwnership(true);
     if (!('release' in ownership)) return execute();
@@ -5499,6 +5506,7 @@ export class Run<
       return;
     }
 
+    await this.beforeRunClaim();
     const claimed = await this.runStorage.updateHeader({ status: 'running', expectedStatus });
 
     if (claimed) {
